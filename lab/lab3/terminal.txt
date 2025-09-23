@@ -1,0 +1,86 @@
+Microsoft Windows [版本 10.0.19045.6332]
+(c) Microsoft Corporation。保留所有权利。
+
+C:\Users\moduo>curl -I https://www.sustech.edu.cn
+HTTP/1.1 200 OK
+Server: nginx
+Date: Tue, 23 Sep 2025 08:32:24 GMT
+Content-Type: text/html
+Content-Length: 147477
+Connection: keep-alive
+Vary: Accept-Encoding
+Last-Modified: Tue, 23 Sep 2025 08:20:02 GMT
+Vary: Accept-Encoding
+ETag: "68d25832-24015"
+Accept-Ranges: bytes
+X-Frame-Options: SAMEORIGIN
+
+
+
+C:\Users\moduo>curl -I http://sustech.edu.cn
+HTTP/1.1 301 Moved Permanently
+Server: nginx
+Date: Tue, 23 Sep 2025 08:35:21 GMT
+Content-Type: text/html
+Content-Length: 162
+Connection: keep-alive
+Location: https://www.sustech.edu.cn/
+X-Frame-Options: SAMEORIGIN
+
+
+C:\Users\moduo>curl -I https://sustech.edu.cn
+HTTP/1.1 200 OK
+Server: nginx
+Date: Tue, 23 Sep 2025 08:38:28 GMT
+Content-Type: text/html
+Content-Length: 147477
+Connection: keep-alive
+Vary: Accept-Encoding
+Last-Modified: Tue, 23 Sep 2025 08:30:03 GMT
+Vary: Accept-Encoding
+ETag: "68d25a8b-24015"
+Accept-Ranges: bytes
+X-Frame-Options: SAMEORIGIN
+
+
+
+C:\Users\moduo>curl -I http://www.sina.com.cn
+HTTP/1.1 302 Found
+Server: Tengine
+Date: Tue, 23 Sep 2025 08:43:51 GMT
+Content-Type: text/html
+Content-Length: 242
+Connection: keep-alive
+Location: https://www.sina.com.cn/
+X-DSL-CHECK: 5
+X-Via-CDN: f=aliyun,s=cache26.cn3070,c=2001:da8:201d:1113::f335;
+Via: cache26.cn3070[,0]
+Timing-Allow-Origin: *
+EagleId: 779329ae17586170317544887e
+
+
+C:\Users\moduo>curl -I https://www.sina.com.cn
+HTTP/1.1 200 OK
+Server: Tengine
+Content-Type: text/html
+Content-Length: 396785
+Connection: keep-alive
+Date: Tue, 23 Sep 2025 08:45:28 GMT
+Vary: Accept-Encoding
+ETag: "68d25e10-5bc5d"V=5965C31
+X-Powered-By: shci_v1.13
+Expires: Tue, 23 Sep 2025 08:46:23 GMT
+Cache-Control: max-age=60
+X-Via-SSL: ssl.63.sinag1.shx.lb.sinanode.com
+Edge-Copy-Time: 1758617123237
+Via: http/1.1 ctc.guangzhou.union.50 (ApacheTrafficServer/6.2.1 [cRs f ]), cache37.l2cn3008[0,0,200-0,H], cache37.l2cn3008[0,0], cache25.cn3070[0,0,200-0,H], cache5.cn3070[3,0]
+X-Via-CDN: f=aliyun,s=cache5.cn3070,c=2001:da8:201d:1113::f335;f=sinaedge,s=cmcc.guangzhou.union.7777.nb.sinaedge.com,c=183.134.36.57;f=Edge,s=ctc.guangzhou.union.50,c=172.16.174.77
+X-Via-Edge: 1758617128028392486b74dae10ac41698f22
+Age: 11
+Ali-Swift-Global-Savetime: 1758617128
+X-Cache: HIT TCP_MEM_HIT dirn:-2:-2
+X-Swift-SaveTime: Tue, 23 Sep 2025 08:45:28 GMT
+X-Swift-CacheTime: 60
+Timing-Allow-Origin: *
+EagleId: 7793299917586171396904779e
+
