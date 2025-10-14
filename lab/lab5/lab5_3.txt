@@ -1,0 +1,87 @@
+D:\E\SUSTECH\grade3\3_up\CS\Computer_Networks\lab>py dns_client.py www.sina.com.cn A
+=== Iterative resolution trace for www.sina.com.cn A (RD=0) ===
+[1] from 192.33.4.12  AA=0 RA=0 RD=0 RCODE=0
+  Authority:
+    cn  NS=b.dns.cn
+    cn  NS=a.dns.cn
+    cn  NS=d.dns.cn
+    cn  NS=e.dns.cn
+    cn  NS=ns.cernet.net
+    cn  NS=c.dns.cn
+  Additional:
+    ns.cernet.net  A=202.112.0.44
+    e.dns.cn  A=203.119.29.1
+    d.dns.cn  A=203.119.28.1
+    c.dns.cn  A=203.119.27.1
+    b.dns.cn  A=203.119.26.1
+    a.dns.cn  A=203.119.25.1
+    e.dns.cn  AAAA=2001:dc7:3::1
+    d.dns.cn  AAAA=2001:dc7:1000::1
+    c.dns.cn  AAAA=2001:dc7:2::1
+    b.dns.cn  AAAA=2001:dc7:1::1
+    a.dns.cn  AAAA=2001:dc7::1
+[2] from 203.119.29.1  AA=0 RA=0 RD=0 RCODE=0
+  Authority:
+    sina.com.cn  NS=ns1.sina.com.cn
+    sina.com.cn  NS=ns2.sina.com.cn
+    sina.com.cn  NS=ns3.sina.com.cn
+    sina.com.cn  NS=ns4.sina.com.cn
+  Additional:
+    ns1.sina.com.cn  A=221.179.193.14
+    ns2.sina.com.cn  A=180.149.138.199
+    ns3.sina.com.cn  A=123.125.29.99
+    ns4.sina.com.cn  A=183.60.92.12
+[3] from 123.125.29.99  AA=1 RA=0 RD=0 RCODE=0
+  Answers:
+    www.sina.com.cn  type=5  ttl=60  rdata=spool.grid.sinaedge.com
+[4] from 183.60.92.12  AA=0 RA=0 RD=0 RCODE=5
+[5] from 193.0.14.129  AA=0 RA=0 RD=0 RCODE=0
+  Authority:
+    com  NS=a.gtld-servers.net
+    com  NS=b.gtld-servers.net
+    com  NS=c.gtld-servers.net
+    com  NS=d.gtld-servers.net
+    com  NS=e.gtld-servers.net
+    com  NS=f.gtld-servers.net
+    com  NS=g.gtld-servers.net
+    com  NS=h.gtld-servers.net
+    com  NS=i.gtld-servers.net
+    com  NS=j.gtld-servers.net
+    com  NS=k.gtld-servers.net
+    com  NS=l.gtld-servers.net
+    com  NS=m.gtld-servers.net
+  Additional:
+    a.gtld-servers.net  A=192.5.6.30
+    a.gtld-servers.net  AAAA=2001:503:a83e::2:30
+    b.gtld-servers.net  A=192.33.14.30
+    b.gtld-servers.net  AAAA=2001:503:231d::2:30
+    c.gtld-servers.net  A=192.26.92.30
+    c.gtld-servers.net  AAAA=2001:503:83eb::30
+    d.gtld-servers.net  A=192.31.80.30
+    d.gtld-servers.net  AAAA=2001:500:856e::30
+    e.gtld-servers.net  A=192.12.94.30
+    e.gtld-servers.net  AAAA=2001:502:1ca1::30
+    f.gtld-servers.net  A=192.35.51.30
+[6] from 192.12.94.30  AA=0 RA=0 RD=0 RCODE=0
+  Authority:
+    sinaedge.com  NS=ns1.sinaedge.com
+    sinaedge.com  NS=ns2.sinaedge.com
+    sinaedge.com  NS=ns3.sinaedge.com
+    sinaedge.com  NS=ns4.sinaedge.com
+    sinaedge.com  NS=ns5.sinaedge.com
+    sinaedge.com  NS=ns6.sinaedge.com
+  Additional:
+    ns1.sinaedge.com  A=112.90.6.146
+    ns2.sinaedge.com  A=125.94.246.134
+    ns3.sinaedge.com  A=49.7.37.190
+    ns4.sinaedge.com  A=221.179.175.225
+    ns5.sinaedge.com  A=116.133.8.38
+    ns6.sinaedge.com  A=36.51.254.87
+[7] from 221.179.175.225  AA=1 RA=0 RD=0 RCODE=0
+  Answers:
+    spool.grid.sinaedge.com  type=1  ttl=60  rdata=183.232.23.228
+=== End trace ===
+
+Final server: 221.179.175.225  AA=1 RA=0 RD=0 RCODE=0
+Final Answers:
+  spool.grid.sinaedge.com  type=1  ttl=60  rdata=183.232.23.228
