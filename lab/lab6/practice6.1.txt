@@ -1,0 +1,169 @@
+Microsoft Windows [版本 10.0.19045.6456]
+(c) Microsoft Corporation。保留所有权利。
+
+C:\Users\moduo>curl.exe -I -L -v https://www.sina.com.cn
+* Host www.sina.com.cn:443 was resolved.
+* IPv6: 240e:97c:4040:903:3::3fb, 240e:97c:401c:100:3::3df, 240e:97c:38:600:3::3e7, 240e:97e:2000:900:3::3ea, 240e:615:6e05:1:3::11
+* IPv4: 14.215.172.203, 119.147.41.221, 14.215.172.207, 119.147.112.103, 14.215.172.204, 113.96.132.223, 119.147.41.217, 59.36.214.240, 124.226.72.70, 119.147.112.110, 124.226.72.72, 59.36.214.237, 113.96.132.227, 119.147.41.218, 119.147.41.222, 14.215.172.211
+*   Trying [240e:97c:4040:903:3::3fb]:443...
+* schannel: disabled automatic use of client certificate
+* ALPN: curl offers http/1.1
+* ALPN: server accepted http/1.1
+* Connected to www.sina.com.cn (240e:97c:4040:903:3::3fb) port 443
+* using HTTP/1.x
+> HEAD / HTTP/1.1
+> Host: www.sina.com.cn
+> User-Agent: curl/8.13.0
+> Accept: */*
+>
+* Request completely sent off
+< HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+< Server: Tengine
+Server: Tengine
+< Content-Type: text/html
+Content-Type: text/html
+< Content-Length: 395423
+Content-Length: 395423
+< Connection: keep-alive
+Connection: keep-alive
+< Date: Tue, 21 Oct 2025 03:49:43 GMT
+Date: Tue, 21 Oct 2025 03:49:43 GMT
+< Expires: Tue, 21 Oct 2025 03:50:08 GMT
+Expires: Tue, 21 Oct 2025 03:50:08 GMT
+< Cache-Control: max-age=60
+Cache-Control: max-age=60
+< Via: http/1.1 cnc.guangzhou.union.67 (ApacheTrafficServer/6.2.1 [cRs f ]), cache37.l2cn3008[0,0,200-0,H], cache61.l2cn3008[1,0], vcache4.cn4597[0,0,200-0,H], vcache4.cn4597[5,0]
+Via: http/1.1 cnc.guangzhou.union.67 (ApacheTrafficServer/6.2.1 [cRs f ]), cache37.l2cn3008[0,0,200-0,H], cache61.l2cn3008[1,0], vcache4.cn4597[0,0,200-0,H], vcache4.cn4597[5,0]
+< X-Via-CDN: f=aliyun,s=vcache4.cn4597,c=2001:da8:201d:1113::fc93;f=sinaedge,s=cmcc.guangzhou.union.72.nb.sinaedge.com,c=183.134.36.57;f=Edge,s=cnc.guangzhou.union.67,c=172.16.174.72
+X-Via-CDN: f=aliyun,s=vcache4.cn4597,c=2001:da8:201d:1113::fc93;f=sinaedge,s=cmcc.guangzhou.union.72.nb.sinaedge.com,c=183.134.36.57;f=Edge,s=cnc.guangzhou.union.67,c=172.16.174.72
+< X-Via-Edge: 1761018583018392486b748ae10ac55767317
+X-Via-Edge: 1761018583018392486b748ae10ac55767317
+< Vary: Accept-Encoding
+Vary: Accept-Encoding
+< ETag: W/"68f70273-5b70b"V=5965C31
+ETag: W/"68f70273-5b70b"V=5965C31
+< X-Powered-By: shci_v1.13
+X-Powered-By: shci_v1.13
+< X-Via-SSL: ssl.61.sinag1.shx.lb.sinanode.com
+X-Via-SSL: ssl.61.sinag1.shx.lb.sinanode.com
+< Edge-Copy-Time: 1761018491916
+Edge-Copy-Time: 1761018491916
+< Age: 26
+Age: 26
+< Ali-Swift-Global-Savetime: 1761018583
+Ali-Swift-Global-Savetime: 1761018583
+< X-Cache: HIT TCP_MEM_HIT dirn:-2:-2
+X-Cache: HIT TCP_MEM_HIT dirn:-2:-2
+< X-Swift-SaveTime: Tue, 21 Oct 2025 03:49:43 GMT
+X-Swift-SaveTime: Tue, 21 Oct 2025 03:49:43 GMT
+< X-Swift-CacheTime: 60
+X-Swift-CacheTime: 60
+< Timing-Allow-Origin: *
+Timing-Allow-Origin: *
+< EagleId: 3b24d69817610186099275206e
+EagleId: 3b24d69817610186099275206e
+<
+
+* Connection #0 to host www.sina.com.cn left intact
+
+C:\Users\moduo>nslookup www.sina.com.cn
+服务器:  ns1.sustech.edu.cn
+Address:  172.18.1.92
+
+非权威应答:
+名称:    ww1.sinaimg.cn.w.alikunlun.com
+Addresses:  240e:97d:2008:a00:3::3e9
+          240e:97c:4040:903:3::3fc
+          240e:97e:2000:900:3::3ea
+          240e:97c:38:600:3::3e7
+          240e:97c:401c:100:3::3e0
+          113.96.132.1
+          59.36.214.238
+          113.96.132.2
+          119.147.41.219
+          119.147.41.221
+          119.147.41.218
+          119.147.41.220
+          119.147.112.104
+          119.147.112.107
+          14.215.172.208
+          14.215.172.211
+          14.215.172.222
+          14.215.172.7
+          59.36.214.237
+          119.147.112.105
+          119.147.112.106
+Aliases:  www.sina.com.cn
+          spool.grid.sinaedge.com
+
+
+C:\Users\moduo>nslookup www.sina.com.cn 8.8.8.8
+服务器:  dns.google
+Address:  8.8.8.8
+
+非权威应答:
+名称:    ww1.sinaimg.cn.w.alikunlun.com
+Addresses:  240e:97c:401c:100:3::3df
+          240e:97d:2008:a00:3::3e8
+          240e:97c:4040:903:3::3fb
+          240e:97e:2000:900:3::3e9
+          240e:97c:38:600:3::3e7
+          119.147.112.107
+          119.147.112.103
+          113.96.132.225
+          119.147.41.219
+          119.147.41.215
+          14.215.172.7
+          119.147.41.221
+          119.147.41.217
+          113.96.132.227
+          14.215.172.8
+          59.36.214.233
+          119.147.112.104
+          14.215.172.222
+          119.147.112.109
+          14.215.172.207
+          59.36.214.235
+Aliases:  www.sina.com.cn
+          spool.grid.sinaedge.com
+
+
+C:\Users\moduo>nslookup -type=CNAME www.sina.com.cn
+服务器:  ns1.sustech.edu.cn
+Address:  172.18.1.92
+
+非权威应答:
+www.sina.com.cn canonical name = spool.grid.sinaedge.com
+
+C:\Users\moduo>nslookup spool.grid.sinaedge.com
+服务器:  ns1.sustech.edu.cn
+Address:  172.18.1.92
+
+非权威应答:
+名称:    ww1.sinaimg.cn.w.alikunlun.com
+Addresses:  240e:97c:401c:100:3::3df
+          240e:97c:4040:903:3::3fb
+          240e:615:6e05:1:3::10
+          240e:97c:38:600:3::3e7
+          240e:97e:2000:900:3::3ea
+          113.96.132.226
+          14.215.172.7
+          119.147.41.219
+          14.215.172.204
+          119.147.112.104
+          119.147.112.103
+          119.147.41.220
+          119.147.41.222
+          14.215.172.203
+          113.96.132.225
+          119.147.112.106
+          119.147.112.105
+          59.36.214.234
+          59.36.214.233
+          119.147.41.221
+          14.215.172.8
+Aliases:  spool.grid.sinaedge.com
+
+
+C:\Users\moduo>
