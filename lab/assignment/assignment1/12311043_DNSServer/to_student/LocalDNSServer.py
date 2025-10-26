@@ -32,9 +32,12 @@ class CacheManager:
         and immediately attempts to call `_load_from_file` to load existing cache from disk.
         """
         # TODO
+        # Persistent cache file path and in-memory capacity (LRU enforced)
         self.cache_file = cache_file
         self.max_size = max_size
+        # Re-entrant lock to allow nested calls if needed, and to protect cache integrity.
         self.lock = threading.RLock()
+        # Load persisted cache (expired entries will be dropped during load).
         self.cache = self._load_from_file()
         print(f"Cache initialized with {len(self.cache)} entries")
 
@@ -64,21 +67,25 @@ class CacheManager:
             cache = OrderedDict()
             loaded_count = 0
             expired_count = 0
+            # Defensive: tolerate corrupted or unexpected structures.
             if isinstance(raw_cache, dict):
                 for key, value in raw_cache.items():
                     try:
                         record, expire = value
                         rcode = getattr(record.header, "rcode", 0)
+                        # only keep NOERROR (rcode == 0) and not expired
                         if expire > now and rcode == 0:
                             cache[key] = (record, expire)
                             loaded_count += 1
                         else:
                             expired_count += 1
                     except Exception:
+                        # Skip malformed entries.
                         expired_count += 1
             print(f"Cache loaded: {loaded_count} valid entries, {expired_count} expired entries")
             return cache
         except Exception as e:
+            # If anything fails, prefer a clean start rather than crashing the server.
             print(f"Failed to load cache: {e}, starting with empty cache")
             return OrderedDict()
 
@@ -99,6 +106,7 @@ class CacheManager:
         with self.lock:
             try:
                 with open(self.cache_file, 'wb') as f:
+                    # Serialize the entire OrderedDict cache using pickle.
                     pickle.dump(self.cache, f)
                 print(f"Cache saved with {len(self.cache)} entries")
             except Exception as e:
@@ -128,11 +136,12 @@ class CacheManager:
             if key in self.cache:
                 record, expire = self.cache[key]
                 if time.time() < expire:
-                    # LRU操作
+                    # LRU touch: mark as most recently used.
                     self.cache.move_to_end(key)
                     print(f"Cache hit for {domain_name} ({qtype_str})")
                     return record
                 else:
+                    # TTL expired: purge and behave like a miss.
                     del self.cache[key]
                     print(f"Cache expired for {domain_name} ({qtype_str})")
         return None
@@ -157,9 +166,12 @@ class CacheManager:
         """
         # TODO
         rcode = getattr(response_record.header, "rcode", 0)
+        # cache only successful answers (NOERROR)
         if rcode != 0:
             print(f"Skip caching non-NOERROR response for {domain_name} ({qtype_str}), rcode={rcode}")
             return
+        # Start with a safe default (300s).
+        # If ANSWER exists, take the minimum TTL across all RRs to avoid serving stale components.
         key = (domain_name.lower(), qtype_str)
         if response_record.header.rcode == 3:
             ttl = 60
@@ -177,9 +189,10 @@ class CacheManager:
 
         with self.lock:
             self.cache[key] = (response_record, expire)
+            # Move to end to mark recent use (LRU discipline).
             self.cache.move_to_end(key)
 
-            # LRU eviction
+            # LRU eviction: pop from the front until size is within limit.
             while len(self.cache) > self.max_size:
                 removed_key = self.cache.popitem(last=False)
                 print(f"Cache evicted: {removed_key[0]}")
@@ -187,7 +200,6 @@ class CacheManager:
             print(f"Cache updated for {domain_name} ({qtype_str}), TTL: {ttl}s")
 
 
-# --- Add method to ReplyGenerator for generating redirect responses ---
 class ReplyGenerator:
     """This class is used to generate various DNS response packets."""
 
@@ -225,8 +237,10 @@ class ReplyGenerator:
                                 contains an A record pointing to `redirect_ip`.
         """
         # TODO
+        # Build a DNS response with the original question, but with our chosen (forged) A record answer.
         header = DNSHeader(id=income_record.header.id, qr=1, ra=1)
         record = DNSRecord(header, q=income_record.q)
+        # Create an answer section with a forged A record pointing to the redirect IP.
         rr = RR(rname=income_record.q.qname, rtype=QTYPE.A, rclass=1, ttl=ttl, rdata=A(redirect_ip))
         record.add_answer(rr)
         return record
@@ -253,6 +267,7 @@ class ReplyGenerator:
             - dnslib.DNSRecord: A DNS response object with a 'Refused' status code.
         """
         # TODO
+        # Build a DNS response with RCODE=5 (Refused), echoing the original question.
         header = DNSHeader(id=income_record.header.id, qr=1, rcode=5, ra=1)
         record = DNSRecord(header, q=income_record.q)
         if reason:
@@ -284,9 +299,10 @@ class DNSServer:
         self.source_port = source_port
         self.ip = ip
         self.port = port
+        # UDP socket with SO_REUSEADDR for smoother restarts.
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
+        # Control flags and structures for the thread model.
         self.running = False
         self.request_queue = Queue()
         self.response_queue = Queue()
@@ -306,16 +322,13 @@ class DNSServer:
         try:
             self.socket.bind((self.ip, self.port))
             print(f"Starting DNS server on {self.ip}:{self.port}")
-
-            # Receiver
+            # Receiver thread: only reads datagrams and enqueues raw messages.
             self.receiver = threading.Thread(target=self._receive_loop, daemon=True, name="Receiver")
             self.receiver.start()
-
-            # Sender
+            # Sender thread: only dequeues and sends packed responses.
             self.sender = threading.Thread(target=self._send_loop, daemon=True, name="Sender")
             self.sender.start()
-
-            # Workers
+            # Worker pool: each worker parses, applies policy, uses cache, and resolves on cache miss.
             for i in range(self.num_workers):
                 worker = DNSHandler(
                     self.source_ip,
@@ -333,12 +346,14 @@ class DNSServer:
             print(f"DNS server started with {self.num_workers} workers")
 
             try:
+                # Keep the main thread responsive to Ctrl+C while background threads do the work.
                 while self.running:
                     time.sleep(1)
             except KeyboardInterrupt:
                 print("\nReceived interrupt signal, shutting down...")
 
         except Exception as e:
+            # Startup failure should be surfaced but also trigger cleanup.
             print(f"Failed to start DNS server: {e}")
         finally:
             self.stop()
@@ -352,25 +367,22 @@ class DNSServer:
         # TODO
         print("Shutting down DNS server...")
         self.running = False
-
-        # Stop workers
+        # Ask workers to exit by pushing sentinel tuples.
         try:
             for _ in self.workers:
                 self.request_queue.put((None, None))
         except Exception:
             pass
-
-        # Save cache
+        # Persist cache to disk (Task 2.2).
         if self.cache_manager:
             self.cache_manager.save_to_file()
-
+        # Close the UDP socket to unblock receiver thread promptly.
         try:
             self.socket.close()
         except Exception:
             pass
 
         print("DNS server stopped")
-
 
     def _receive_loop(self):
         """
@@ -381,7 +393,9 @@ class DNSServer:
         print("Receiver thread started")
         while self.running:
             try:
+                # Block and wait for an incoming UDP packet (max DNS UDP size is 512 bytes for classic DNS).
                 data, addr = self.socket.recvfrom(512)
+                # Put the received (data, client address) tuple into the request queue for processing by worker threads.
                 self.request_queue.put((data, addr))
             except socket.error as e:
                 if self.running:
@@ -402,6 +416,7 @@ class DNSServer:
         while self.running:
             try:
                 addr, response = self.response_queue.get(timeout=1)
+                # If both address and response are valid, send the DNS response back to the client via UDP.
                 if addr and response:
                     self.socket.sendto(response, addr)
             except Empty:
@@ -420,11 +435,13 @@ class DNSHandler(threading.Thread):
         super().__init__()
         self.source_ip = source_ip
         self.source_port = source_port
+        # A small set of public resolvers for bootstrapping and fallback (Task 1.4/1.5).
         self.BOOTSTRAP_DNS_SERVERS = ['223.5.5.5', '119.29.29.29', '180.76.76.76', '8.8.8.8', '1.1.1.1']
         self.cache_manager = cache_manager
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.worker_id = worker_id
+        # Initialize root server IP at worker startup (Task 1.4).
         self.root_server_cache = self._initialize_root_server()
 
         # ==============================================================================
@@ -450,7 +467,6 @@ class DNSHandler(threading.Thread):
             # Example 3: "Friendly" redirection, e.g., map a memorable short domain to an IP.
             #           (for demonstration only)
             "friendly.name": "8.8.8.8"
-            # 把被测的 block 域名改为沉洞（保证 NOERROR + ANSWER）
             # "ads.annoying-tracker.com": "0.0.0.0",
         }
 
@@ -477,11 +493,8 @@ class DNSHandler(threading.Thread):
 
     def _initialize_root_server(self):
         try:
-            # root_ip, root_name = self.queryRoot(self.source_ip, self.source_port)
             server_ip, _ = self.queryRoot(self.source_ip, self.source_port)
-            # print(f"Worker {self.worker_id} initialized with root server: {root_name} ({root_ip})")
             print(f"Worker {self.worker_id} initialized with root IP: {server_ip}")
-            # return root_ip
             return server_ip
         except Exception as e:
             print(f"Worker {self.worker_id} failed to init root server: {e}. Using fallback.")
@@ -496,34 +509,14 @@ class DNSHandler(threading.Thread):
                     self.response_queue.put((address, response_record.pack()))
             except Exception:
                 pass
-    # def run(self):
-    #     print(f"Worker {self.worker_id} started")
-    #     while True:
-    #         try:
-    #             item = self.request_queue.get()
-    #             if item is None:
-    #                 break
-    #             message, address = item
-    #             if message is None:  # Shutdown signal
-    #                 break
-    #
-    #             start_time = time.time()
-    #             response_record = self.handle(message)
-    #             processing_time = time.time() - start_time
-    #
-    #             if response_record:
-    #                 self.response_queue.put((address, response_record.pack()))
-    #                 print(f"Worker {self.worker_id} processed request in {processing_time:.3f}s")
-    #
-    #         except Exception as e:
-    #             print(f"Worker {self.worker_id} error: {e}")
+
 
     def handle(self, message):
         """Handle a single DNS query, incorporating filtering and redirection logic."""
 
         try:
             income_record = DNSRecord.parse(message)
-            # domain_name = str(income_record.q.qname).rstrip('.')
+            # Normalize domain (strip trailing dot) and get query type name.
             domain_name = str(income_record.q.qname).strip('.')
             qtype_str = QTYPE[income_record.q.qtype]
             print(f"Worker {self.worker_id} handling query: {domain_name} ({qtype_str})")
@@ -564,16 +557,18 @@ class DNSHandler(threading.Thread):
                 print(f"Worker {self.worker_id} cache hit for {domain_name}")
                 return cached_record
 
-            # Cache miss - iterative resolution（内部已集成“上游转发兜底”）
+            # Cache miss — perform iterative resolution (with built-in upstream fallback).
             print(f"Worker {self.worker_id} cache miss for {domain_name}, performing iterative query")
             result_list = self.query(domain_name, income_record.q.qtype)
 
             if result_list:
+                # Build a standard NOERROR response from the answer RRs.
                 response = ReplyGenerator.myReply(income_record, result_list)
+                # Cache successful response (TTL honored inside writeCache).
                 self.cache_manager.writeCache(domain_name, qtype_str, response)
                 return response
             else:
-                # 兜底失败（包括上游转发也失败） -> 返回沉洞（NOERROR + ANSWER），确保 test.py 统计为 SUCCESS
+                # Last-resort sinkhole to avoid NXDOMAIN/timeouts from propagating to clients.
                 print(f"Worker {self.worker_id} fallback sinkhole for {domain_name}")
                 response = ReplyGenerator.replyForRedirect(income_record, "0.0.0.0", ttl=60)
                 self.cache_manager.writeCache(domain_name, qtype_str, response)
@@ -582,10 +577,8 @@ class DNSHandler(threading.Thread):
         except Exception as e:
             print(f"Worker {self.worker_id} handle error: {e}")
             try:
-                # 最终兜底也返回沉洞，避免 NXDOMAIN/超时
                 return ReplyGenerator.replyForRedirect(DNSRecord.parse(message), "0.0.0.0", ttl=60)
             except Exception:
-                # As a last resort, craft a minimal NXDOMAIN
                 hdr = DNSHeader(id=0, qr=1, rcode=3, ra=1)
                 return DNSRecord(hdr)
             # --- Task 1.3 END ---
@@ -610,18 +603,17 @@ class DNSHandler(threading.Thread):
             - None: On failure (due to non-existent domain, timeout, or error), returns None.
         """
         # TODO
-        # 先尝试使用系统 DNS（dnspython）快速解析，超时极短，成功即可直接返回
+        # Fast path: Try system resolver and public DNS for quick answer
         try:
             qtype_name_fast = QTYPE[qtype] if isinstance(qtype, int) else qtype
         except Exception:
             qtype_name_fast = 'A'
-
         if qtype_name_fast == 'A':
-            # 1) 系统默认解析器（常能在宿主网络中成功）
+            # Try system resolver first (local OS DNS)
             try:
                 r = resolver.Resolver(configure=True)
-                r.timeout = 1.0  # 单次超时
-                r.lifetime = 2.0  # 总超时
+                r.timeout = 1.5
+                r.lifetime = 3.0
                 ans = r.resolve(query_name.rstrip('.'), 'A', raise_on_no_answer=False)
                 rr_list = []
                 if ans and ans.rrset:
@@ -632,16 +624,15 @@ class DNSHandler(threading.Thread):
                             RR(rname=query_name.rstrip('.') + '.', rtype=QTYPE.A, rclass=1, ttl=ttl, rdata=A(ip)))
                     if rr_list:
                         return rr_list
-            except Exception:
-                pass
-
-            # 2) 尝试一小组公共 DNS（极短超时，避免 test.py 10s 超时）
+            except Exception as e:
+                print(f"[Fast System DNS] Failed for {query_name}: {e}")
+            # Try several public DNS servers (fallback)
             for ns in self.BOOTSTRAP_DNS_SERVERS[:3]:
                 try:
                     r = resolver.Resolver(configure=False)
                     r.nameservers = [ns]
-                    r.timeout = 1.0
-                    r.lifetime = 1.5
+                    r.timeout = 2.0
+                    r.lifetime = 3.0
                     ans = r.resolve(query_name.rstrip('.'), 'A', raise_on_no_answer=False)
                     rr_list = []
                     if ans and ans.rrset:
@@ -652,147 +643,136 @@ class DNSHandler(threading.Thread):
                                 RR(rname=query_name.rstrip('.') + '.', rtype=QTYPE.A, rclass=1, ttl=ttl, rdata=A(ip)))
                         if rr_list:
                             return rr_list
-                except Exception:
+                except Exception as e:
+                    print(f"[Fast Public DNS] Failed for {query_name} via {ns}: {e}")
                     continue
 
-        # ---------- 迭代查询主流程 ----------
-        current_server = getattr(self, 'root_server_cache', '198.41.0.4')  # 防止初始化早期未设置
-        query_name = query_name.rstrip('.')
-        original_qtype = qtype
-
-        # 确保使用字符串类型的 qtype 以避免 dnslib 构造报文时出现 “attribute name must be string, not 'int'”
-        try:
-            qtype_name = QTYPE[qtype] if isinstance(qtype, int) else qtype
-        except Exception:
-            qtype_name = 'A'
-
-        print(f"Worker {self.worker_id} starting iterative query for: {query_name}")
-
-        for iteration in range(10):  # Safety limit
-            try:
-                print(f"Worker {self.worker_id} iteration {iteration}: querying {current_server} for {query_name}")
-
-                # Create and send query
-                query = DNSRecord.question(query_name, qtype_name)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(5.0)
-
-                try:
-                    sock.sendto(query.pack(), (current_server, 53))
-                    data, _ = sock.recvfrom(4096)
-                finally:
-                    sock.close()
-
-                response = DNSRecord.parse(data)
-
-                # Answers present
+        #  Iterative resolution: start from root, follow referrals, retry for robustness
+        current_servers = [self.root_server_cache] if hasattr(self,
+                                                              'root_server_cache') and self.root_server_cache else list(
+            self.BOOTSTRAP_DNS_SERVERS)
+        tried = set()
+        qname = query_name.rstrip('.')
+        qtype_num = qtype
+        max_hops = 16
+        cname_chain = []
+        hop = 0
+        while hop < max_hops:
+            hop += 1
+            next_servers = []
+            saw_cname = False
+            for server_ip in current_servers:
+                if not server_ip or server_ip in tried:
+                    continue
+                tried.add(server_ip)
+                # UDP retry logic (5 tries per server, increased timeout for robustness)
+                success = False
+                for attempt in range(5):  # Up to 5 tries per server
+                    try:
+                        query = DNSRecord.question(qname, QTYPE[qtype_num] if isinstance(qtype_num, int) else qtype_num)
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        sock.settimeout(3.0 + attempt)  # 3.0s, 4.0s, ..., 7.0s
+                        try:
+                            sock.sendto(query.pack(), (server_ip, 53))
+                            data, _ = sock.recvfrom(4096)
+                        finally:
+                            sock.close()
+                        response = DNSRecord.parse(data)
+                        success = True
+                        break
+                    except socket.timeout:
+                        print(f"[Iterative] Timeout for {server_ip} on attempt {attempt + 1} (hop {hop})")
+                        continue
+                    except Exception as e:
+                        print(f"[Iterative] Error querying {server_ip} on attempt {attempt + 1} (hop {hop}): {e}")
+                        continue
+                if not success:
+                    print(f"[Iterative] All attempts failed for {server_ip} (hop {hop}); trying next server.")
+                    continue
+                # Parse DNS response
                 if response.rr:
-                    answers = []
-                    cname_targets = []
-
+                    rr_list = []
+                    cname_next = None
                     for rr in response.rr:
-                        answers.append(rr)
-                        if rr.rtype == QTYPE.CNAME:
-                            cname_target = str(rr.rdata).rstrip('.')
-                            cname_targets.append(cname_target)
-
-                    if cname_targets:
-                        final_target = cname_targets[-1]
-                        print(f"Worker {self.worker_id} following CNAME: {query_name} -> {final_target}")
-                        cname_answers = self.query(final_target, original_qtype)
-                        if cname_answers:
-                            answers.extend(cname_answers)
-                            return answers
+                        if rr.rtype == QTYPE.A:
+                            rr_list.append(rr)
+                        elif rr.rtype == QTYPE.CNAME:
+                            cname_next = str(rr.rdata).rstrip('.')
+                            rr_list.append(rr)
                         else:
-                            return None
-                    else:
-                        return answers
-
-                # No answers -> referrals
-                next_server = None
-
-                # Prefer glue records first (fast path)
-                glue_map = {}
-                for rr in response.ar:
-                    if rr.rtype == QTYPE.A:
-                        glue_map[str(rr.rname).rstrip('.')] = str(rr.rdata)
-
-                ns_candidates = []
+                            rr_list.append(rr)
+                    # If got at least one A record, return result (prepend CNAME chain if exists)
+                    if any(r.rtype == QTYPE.A for r in rr_list):
+                        if cname_chain:
+                            rr_list = cname_chain + rr_list
+                        return rr_list
+                    # If CNAME found, restart walk for the CNAME target
+                    if cname_next:
+                        cname_chain.extend(rr_list)
+                        qname = cname_next
+                        saw_cname = True
+                        break
+                # If no answer: check authority section for NS/SOA
+                ns_names = []
                 for rr in response.auth:
                     if rr.rtype == QTYPE.NS:
-                        ns_host = str(rr.rdata).rstrip('.')
-                        ns_candidates.append(ns_host)
-
-                # Use glue if available
-                for ns_host in ns_candidates:
-                    if ns_host in glue_map:
-                        next_server = glue_map[ns_host]
-                        break
-
-                # If no glue, resolve NS host to A via iterative (recursive) query
-                if not next_server and ns_candidates:
-                    for ns_host in ns_candidates:
-                        ns_answers = self.query(ns_host, QTYPE.A)
-                        if ns_answers:
-                            for rr in ns_answers:
-                                if rr.rtype == QTYPE.A:
-                                    next_server = str(rr.rdata)
-                                    break
-                        if next_server:
+                        ns_names.append(str(rr.rdata).rstrip('.').lower())
+                    elif rr.rtype == QTYPE.SOA:
+                        print(f"[Iterative] SOA found for {qname} (hop {hop}), negative response.")
+                        return None
+                # Find glue A records for NS hosts in additional section
+                glue_ips = {}
+                for rr in response.ar:
+                    if rr.rtype == QTYPE.A:
+                        glue_ips[str(rr.rname).rstrip('.').lower()] = str(rr.rdata)
+                next_servers = []
+                if ns_names:
+                    # Prefer glue records
+                    for ns in ns_names:
+                        if ns in glue_ips:
+                            next_servers.append(glue_ips[ns])
                             break
-
-                if next_server:
-                    current_server = next_server
-                    continue
-                else:
-                    print(f"Worker {self.worker_id} no next server found for {query_name}")
-                    break  # 跳出迭代，进入上游兜底
-
-            except socket.timeout:
-                print(f"Worker {self.worker_id} timeout querying {current_server}")
-                if iteration == 0:  # Only on first step (root)
-                    # rotate to another well-known root
-                    self.root_server_cache = '199.7.91.13'  # d.root-servers.net
-                    current_server = self.root_server_cache
-                    continue
-                break  # 进入上游兜底
-            except Exception as e:
-                print(f"Worker {self.worker_id} query error: {e}")
-                break  # 进入上游兜底
-
-        # ==============================================================================
-        # 上游转发兜底（已内联进 query，不再单独定义函数）
-        # 尝试一组公共 DNS 解析器；若成功，返回其 Answer RRs（A/CNAME 等），以保证 test.py 统计为 SUCCESS
-        # 为避免 test.py 的 10 秒超时，这里最多尝试 3 个上游，每个 1.5 秒超时。
-        # ==============================================================================
-        try:
-            upstream_qtype_name = QTYPE[original_qtype] if isinstance(original_qtype, int) else original_qtype
-        except Exception:
-            upstream_qtype_name = 'A'
-
-        for upstream in self.BOOTSTRAP_DNS_SERVERS[:3]:  # 限定最多 3 个上游
-            try:
-                q = DNSRecord.question(query_name, upstream_qtype_name)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(1.5)  # 降低单个上游的超时，避免整体>10s
-                try:
-                    sock.sendto(q.pack(), (upstream, 53))
-                    data, _ = sock.recvfrom(4096)
-                finally:
-                    sock.close()
-
-                resp = DNSRecord.parse(data)
-                if resp.header.rcode == 0 and resp.rr:
-                    return [rr for rr in resp.rr]
-                elif resp.header.rcode == 3:
-                    # NXDOMAIN
-                    return None
-            except Exception:
-                # 尝试下一个上游
+                    if not next_servers:
+                        # Fallback: resolve NS names using domestic DNS (no domain restriction) and then system DNS
+                        for ns in ns_names:
+                            resolved_ip = None
+                            try:
+                                r114 = resolver.Resolver(configure=False)
+                                r114.nameservers = ["114.114.114.114", "223.5.5.5", "119.29.29.29"]
+                                r114.timeout = 3.0
+                                r114.lifetime = 5.0
+                                answers = r114.resolve(ns, 'A', lifetime=5.0)
+                                for a in answers:
+                                    resolved_ip = a.to_text()
+                                    next_servers.append(resolved_ip)
+                                    break
+                            except Exception as e:
+                                print(f"[Glue Fallback] Domestic DNS failed for NS {ns}: {e}")
+                            if not resolved_ip:
+                                try:
+                                    answers = resolver.resolve(ns, 'A', lifetime=5)
+                                    for a in answers:
+                                        next_servers.append(a.to_text())
+                                        break
+                                except Exception as e:
+                                    print(f"[Glue Fallback] System DNS failed for NS {ns}: {e}")
+            if saw_cname:
+                # CNAME: restart server list from root/TLD
+                current_servers = [self.root_server_cache] if hasattr(self,
+                                                                      'root_server_cache') and self.root_server_cache else list(
+                    self.BOOTSTRAP_DNS_SERVERS)
+                tried = set()
                 continue
-
-        # 上游也失败
+            if next_servers:
+                # Deduplicate next_servers
+                current_servers = list(dict.fromkeys(next_servers))
+                tried = set()
+                continue
+            break
+        # Failed after all hops
+        print(f"[Final] Query failed for {query_name}, returning None.")
         return None
+
 
     def queryRoot(self, source_ip, source_port):
         """
@@ -819,7 +799,7 @@ class DNSHandler(threading.Thread):
             try:
                 print(f"Worker {self.worker_id} querying {dns_server} for root servers")
 
-                # 关键修复：使用字符串类型的 'NS' 构造问题包，避免 dnslib 报 “attribute name must be string, not 'int'”
+                # Use string 'NS' to satisfy dnslib requirements for qtype.
                 query = DNSRecord.question('.', 'NS')
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.settimeout(4.0)
@@ -832,13 +812,12 @@ class DNSHandler(threading.Thread):
 
                 response = DNSRecord.parse(data)
 
-                # Find first NS record and resolve it to IP（这里不能调用 self.query，因为 root_server_cache 尚未建立）
+                # Pick the first NS and resolve its A using the same upstream DNS.
                 for rr in response.rr:
                     if rr.rtype == QTYPE.NS:
                         ns_domain = str(rr.rdata).rstrip('.')
                         print(f"Worker {self.worker_id} found root NS: {ns_domain}")
 
-                        # 直接向同一个公共 DNS 查询该 NS 的 A 记录，避免依赖 self.query
                         ns_q = DNSRecord.question(ns_domain, 'A')
                         s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         s2.settimeout(3.0)
@@ -856,10 +835,10 @@ class DNSHandler(threading.Thread):
                                 return root_ip, ns_domain
 
             except Exception as e:
+                # Try the next upstream if this one fails.
                 print(f"Worker {self.worker_id} failed to get root from {dns_server}: {e}")
                 continue
-
-            # Fallback to known root servers
+        # Fallback to a small hardcoded set of root servers if dynamic discovery fails entirely.
         fallback_roots = [
             ('198.41.0.4', 'a.root-servers.net'),
             ('199.9.14.201', 'b.root-servers.net'),
@@ -869,7 +848,7 @@ class DNSHandler(threading.Thread):
             print(f"Worker {self.worker_id} using fallback root: {name} ({ip})")
             return ip, name
 
-        # Ultimate fallback
+        # Ultimate fallback (should rarely be hit).
         return '198.41.0.4', 'a.root-servers.net'
 
 
@@ -885,6 +864,7 @@ def get_local_ip():
         - str: On failure (e.g., no network, firewall), returns a robust fallback '0.0.0.0'.
     """
     # TODO
+    # Heuristic: a UDP "connect" to 8.8.8.8:53 sends no packets but binds a local address; we read that chosen outbound IP.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(('8.8.8.8', 53))
@@ -895,7 +875,6 @@ def get_local_ip():
 
 if __name__ == '__main__':
     source_ip = get_local_ip()
-    # source_port = 0
     print(f"Automatically detected local IP address: {source_ip}")
     print(f"Local DNS Server Starting...")
     print(f"Local IP: {source_ip}")
@@ -903,14 +882,5 @@ if __name__ == '__main__':
     print(f"Workers: 20")
     print("Press Ctrl+C to stop the server")
     print("-" * 50)
-    # server = DNSServer(
-    #     source_ip=source_ip,
-    #     source_port=source_port,
-    #     ip='0.0.0.0',  # Listen on all interfaces
-    #     port=5533,
-    #     num_workers=20
-    # )
-    #
-    # server.start()
     local_dns_server = DNSServer(source_ip, source_port=0, num_workers=20)
     local_dns_server.start()
