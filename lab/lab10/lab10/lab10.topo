@@ -49,7 +49,7 @@
                 <interface sztype="Serial" interfacename="Serial" count="4" />
             </slot>
         </dev>
-        <dev id="B13277C6-FF3E-4af3-9495-AF1E44693FFB" name="Cloud2" poe="0" model="Cloud" settings="" system_mac="" com_port="0" bootmode="0" cx="564.500000" cy="63.500000" edit_left="607" edit_top="148">
+        <dev id="B13277C6-FF3E-4af3-9495-AF1E44693FFB" name="Cloud2" poe="0" model="Cloud" settings="" system_mac="" com_port="0" bootmode="0" cx="745.500000" cy="332.500000" edit_left="788" edit_top="417">
             <slot number="slot17" isMainBoard="1">
                 <interface sztype="Ethernet" interfacename="Ethernet" count="0" />
                 <interface sztype="Ethernet" interfacename="GE" count="0" />
