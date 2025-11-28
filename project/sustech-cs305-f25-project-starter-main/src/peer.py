@@ -66,7 +66,7 @@ g_candidates: Dict[str, List[Tuple[str, int]]] = {}
 # Upload sessions: chunkhash -> session dict
 # session: {'addr': (ip,port), 'chunk_bytes': bytes, 'last_sent_seq': int,
 #           'total_segs': int, 'last_sent_time': float, 'timeout': float}
-g_uploads: Dict[str, Dict] = {}
+g_uploads: Dict[Tuple[str,Tuple[str,int]],Dict] = {}
 
 # Active upload count
 g_active_uploads: int = 0
@@ -184,28 +184,25 @@ def _start_upload_session(chunk_hex: str, addr: Tuple[str, int], sock: simsocket
         "devRTT": initial_timeout / 2.0,
         "timeoutInterval": initial_timeout,
     }
-    g_uploads[chunk_hex] = session
+    key = (chunk_hex, addr)
+    g_uploads[key] = session
     g_active_uploads += 1
 
-    # Send first segment
     next_seq = 1
     start = (next_seq - 1) * MAX_PAYLOAD
     part = chunk_bytes[start:start + MAX_PAYLOAD]
     pkt = _pack_header(PktType.DATA, HEADER_LEN + len(part), seq=next_seq, ack=0) + part
     sock.sendto(pkt, addr)
     now = time.time()
-
-    now = time.time()
     session["last_sent_seq"] = next_seq
     session["last_sent_time"] = now
     session["sent_times"][next_seq] = now
-    # timeoutInterval initially equals timeout (or estimated)
     session["timeoutInterval"] = session["timeout"] if session["timeout"] else session["estimatedRTT"]
 
 
-def _send_data_segment_for_session(chunk_hex: str, sock: simsocket.SimSocket, seq: int = None) -> None:
+def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str,int]], sock: simsocket.SimSocket, seq: int = None) -> None:
     """(Re)send specific segment for an upload session."""
-    session = g_uploads.get(chunk_hex)
+    session = g_uploads.get(session_key)
     if not session:
         return
     addr = session["addr"]
@@ -227,7 +224,19 @@ def _send_data_segment_for_session(chunk_hex: str, sock: simsocket.SimSocket, se
     # If timeoutInterval is not defined, ensure there's a value
     if "timeoutInterval" not in session or not session["timeoutInterval"]:
         session["timeoutInterval"] = session.get("timeout", 0.5)
-
+    try:
+        if seq == total_segs:
+            eof_seq = total_segs + 1
+            eof_pkt = _pack_header(PktType.DATA, HEADER_LEN, seq=eof_seq, ack=0)  # no payload
+            sock.sendto(eof_pkt, addr)
+            # record sent time for EOF seq so RTT sampling & timers still work
+            now2 = time.time()
+            session["sent_times"][eof_seq] = now2
+            session["last_sent_seq"] = eof_seq
+            session["last_sent_time"] = now2
+    except Exception:
+        # be conservative: if anything goes wrong sending EOF, ignore and continue
+        pass
 
 def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     """
@@ -372,75 +381,65 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             sock.sendto(ack_pkt, from_addr)
 
     # ACK: sender side (RDT handling)
+    # ACK (sender side)
     elif pkg_type == PktType.ACK:
         ack_num = ack_h
         now = time.time()
-        # find session for this peer
-        for chunk_hex, session in list(g_uploads.items()):
-            if session["addr"] == (from_addr[0], from_addr[1]):
-                last_sent = session.get("last_sent_seq", 0)
-                total = session.get("total_segs", 0)
-                last_acked = session.get("last_acked", 0)
-                sent_times = session.get("sent_times", {})
 
-                # If this ACK advances the highest cumulative ACK (new information)
-                if ack_num > last_acked:
-                    # Compute SampleRTT if we have a send timestamp for acked seq
-                    if ack_num in sent_times:
-                        sampleRTT = now - sent_times[ack_num]
-                        # Update RTT estimates & dynamic timeoutInterval
-                        rdt_update_rtt(session, sampleRTT)
+        # find sessions for this from_addr
+        for session_key, session in list(g_uploads.items()):
+            chunk_hex, sess_addr = session_key
+            if sess_addr != (from_addr[0], from_addr[1]):
+                continue
 
-                    # advance last_acked
-                    session["last_acked"] = ack_num
-                    # clear dup count for this ack_num (we have new progress)
-                    session["dup_ack_counts"].pop(ack_num, None)
+            last_sent = session.get("last_sent_seq", 0)
+            total = session.get("total_segs", 0)
+            last_acked = session.get("last_acked", 0)
+            sent_times = session.get("sent_times", {})
 
-                    # Remove timestamps for all seq <= ack_num (they are acknowledged)
-                    for s in list(sent_times.keys()):
-                        if s <= ack_num:
-                            session["sent_times"].pop(s, None)
+            if ack_num > last_acked:
+                # new ACK progress
+                if ack_num in sent_times:
+                    sampleRTT = now - sent_times[ack_num]
+                    rdt_update_rtt(session, sampleRTT)
 
-                    # Reset the retransmission timer to avoid immediate retransmit
-                    session["last_sent_time"] = now
+                session["last_acked"] = ack_num
+                session["dup_ack_counts"].pop(ack_num, None)
 
-                    # If ack acknowledges the last sent segment, either finish or send next
-                    if ack_num == last_sent:
-                        if last_sent < total:
-                            next_seq = last_sent + 1
-                            _send_data_segment_for_session(chunk_hex, sock, seq=next_seq)
-                            # ensure last_sent_time is up-to-date (send function sets it)
-                            session["last_sent_time"] = time.time()
-                        else:
-                            # finished sending this chunk
-                            try:
-                                del g_uploads[chunk_hex]
-                            except KeyError:
-                                pass
-                            if g_active_uploads > 0:
-                                g_active_uploads -= 1
+                for s in list(sent_times.keys()):
+                    if s <= ack_num:
+                        session["sent_times"].pop(s, None)
+
+                session["last_sent_time"] = now
+
+                if ack_num == last_sent:
+                    if last_sent < total:
+                        next_seq = last_sent + 1
+                        _send_data_segment_for_session(session_key, sock, seq=next_seq)
+                        session["last_sent_time"] = time.time()
                     else:
-                        # ack acknowledges some earlier seq; we keep sending where we were
-                        if last_sent < total:
-                            next_seq = last_sent + 1
-                            _send_data_segment_for_session(chunk_hex, sock, seq=next_seq)
-                            session["last_sent_time"] = time.time()
-
-                # Duplicate ACK detected (ack_num == last_acked)
-                elif ack_num == last_acked:
-                    # handle duplicate ack counts and fast retransmit
-                    cnt = session.get("dup_ack_counts", {}).get(ack_num, 0) + 1
-                    session.setdefault("dup_ack_counts", {})[ack_num] = cnt
-                    # If reached 3 duplicate ACKs, fast retransmit once for the missing seq (ack_num + 1)
-                    if cnt >= 3 and (ack_num not in session.get("fast_retransmitted", set())):
-                        missing_seq = ack_num + 1
-                        if 1 <= missing_seq <= total:
-                            _send_data_segment_for_session(chunk_hex, sock, seq=missing_seq)
-                            session.setdefault("fast_retransmitted", set()).add(ack_num)
-                            # update timer after fast retransmit
-                            session["last_sent_time"] = time.time()
-                # else: older/out-of-order ack - ignore
-                break
+                        try:
+                            del g_uploads[session_key]
+                        except KeyError:
+                            pass
+                        if g_active_uploads > 0:
+                            g_active_uploads -= 1
+                else:
+                    if last_sent < total:
+                        next_seq = last_sent + 1
+                        _send_data_segment_for_session(session_key, sock, seq=next_seq)
+                        session["last_sent_time"] = time.time()
+            elif ack_num == last_acked:
+                # duplicate ack
+                cnt = session.get("dup_ack_counts", {}).get(ack_num, 0) + 1
+                session.setdefault("dup_ack_counts", {})[ack_num] = cnt
+                if cnt >= 3 and (ack_num not in session.get("fast_retransmitted", set())):
+                    missing_seq = ack_num + 1
+                    if 1 <= missing_seq <= total:
+                        _send_data_segment_for_session(session_key, sock, seq=missing_seq)
+                        session.setdefault("fast_retransmitted", set()).add(ack_num)
+                        session["last_sent_time"] = time.time()
+            break
 
 
     else:
@@ -499,12 +498,12 @@ def peer_run(context: PeerContext) -> None:
                     process_user_input(sock)
             else:
                 now = time.time()
-                for chunk_hex, session in list(g_uploads.items()):
+                for session_key, session in list(g_uploads.items()):
                     last = session.get("last_sent_time", 0)
                     timeout = rdt_get_timeout(session)
                     if now - last > timeout:
                         seq = session.get("last_sent_seq", 1)
-                        _send_data_segment_for_session(chunk_hex, sock, seq=seq)
+                        _send_data_segment_for_session(session_key, sock, seq=seq)
                 pass
     except KeyboardInterrupt:
         pass
@@ -515,10 +514,16 @@ def peer_run(context: PeerContext) -> None:
 def rdt_update_rtt(session: dict, sampleRTT: float) -> None:
     """Update EstimatedRTT / DevRTT / TimeoutInterval per given formulas."""
     # use constants ALPHA, BETA defined earlier
-    prevEst = session.get("estimatedRTT", sampleRTT)
-    prevDev = session.get("devRTT", max(0.0, sampleRTT / 2.0))
-    est = (1 - ALPHA) * prevEst + ALPHA * sampleRTT
-    dev = (1 - BETA) * prevDev + BETA * abs(sampleRTT - est)
+    prevEst = session.get("estimatedRTT", None)
+    prevDev = session.get("devRTT", None)
+    if prevEst is None:
+        # first sample: set estimates directly
+        est = sampleRTT
+        dev = sampleRTT / 2.0
+    else:
+        est = (1 - ALPHA) * prevEst + ALPHA * sampleRTT
+        prevDev = prevDev if prevDev is not None else sampleRTT / 2.0
+        dev = (1 - BETA) * prevDev + BETA * abs(sampleRTT - est)
     session["estimatedRTT"] = est
     session["devRTT"] = dev
     session["timeoutInterval"] = est + 4 * dev
@@ -534,32 +539,6 @@ def rdt_get_timeout(session: dict) -> float:
         # respect user-specified fixed timeout
         return float(session.get("timeout", g_context.timeout))
     return float(session.get("timeoutInterval", session.get("timeout", 0.5)))
-
-
-def rdt_handle_dup_ack(session: dict, ack_num: int, sock: simsocket.SimSocket, chunk_hex: str) -> None:
-    """
-    Maintain dup ack counts (per-round). When dup count reaches 3 for ack_num,
-    do a fast retransmit for missing_seq = ack_num + 1 (only once per ack_num).
-    """
-    last_acked = session.get("last_acked", 0)
-    # If ack advances beyond last_acked, reset dup counters for that ack
-    if ack_num > last_acked:
-        session["dup_ack_counts"].pop(ack_num, None)
-        session["last_acked"] = ack_num
-        return
-
-    # duplicate ack
-    cnt = session["dup_ack_counts"].get(ack_num, 0) + 1
-    session["dup_ack_counts"][ack_num] = cnt
-
-    # only trigger fast retransmit when count == 3 and not triggered before for this ack_num
-    if cnt >= 3 and (ack_num not in session.get("fast_retransmitted", set())):
-        missing_seq = ack_num + 1
-        total = session.get("total_segs", 0)
-        if 1 <= missing_seq <= total:
-            _send_data_segment_for_session(chunk_hex, sock, seq=missing_seq)
-            session.setdefault("fast_retransmitted", set()).add(ack_num)
-
 
 
 def main() -> None:
