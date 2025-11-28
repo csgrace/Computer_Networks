@@ -4,6 +4,11 @@
 export PYTHONPATH=$(pwd)
 pytest test/test_01_basic_handshaking.py -q
 
+pytest test/test_01_basic_handshaking.py
+
+
 运行通过test2：
 export PYTHONPATH=$(pwd)
 pytest test/test_02_basic_transfer.py -q
+
+pytest test/test_02_basic_transfer.py
