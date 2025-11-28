@@ -74,6 +74,10 @@ g_active_uploads: int = 0
 # Output map: chunkhash -> output filename
 g_output_map: Dict[str, str] = {}
 
+# RTT params (as specified)
+ALPHA = 0.15
+BETA = 0.3
+
 def _hex_to_bytes(h: str) -> bytes:
     return bytes.fromhex(h)
 
@@ -150,11 +154,18 @@ def _start_upload_session(chunk_hex: str, addr: Tuple[str, int], sock: simsocket
     """
     Initialize an upload session and send first DATA segment.
     """
-    global g_uploads, g_active_uploads
+    global g_uploads, g_active_uploads, g_context
 
     chunk_bytes = g_context.has_chunks[chunk_hex]
     total_segs = (len(chunk_bytes) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
-    timeout = getattr(g_context, "timeout", 0) or 0.5  # prefer context timeout if set, else 0.5s
+    # timeout = getattr(g_context, "timeout", 0) or 0.5  # prefer context timeout if set, else 0.5s
+
+    # If user specified timeout via context.args, respect it as a fixed starting timeout.
+    preset_timeout = getattr(g_context, "timeout", 0) or 0
+    if preset_timeout:
+        initial_timeout = float(preset_timeout)
+    else:
+        initial_timeout = 0.5  # default initial timeout
 
     session = {
         "addr": addr,
@@ -162,7 +173,16 @@ def _start_upload_session(chunk_hex: str, addr: Tuple[str, int], sock: simsocket
         "last_sent_seq": 0,  # last seq we have sent
         "total_segs": total_segs,
         "last_sent_time": 0.0,
-        "timeout": timeout,
+        "timeout": initial_timeout,
+        # New fields for RDT:
+        "sent_times": {},  # seq -> last sent time
+        "last_acked": 0,  # highest cumulative ack seen
+        "dup_ack_counts": {},  # ack_num -> count
+        "fast_retransmitted": set(),  # ack_nums that have triggered fast retransmit
+        # RTT estimation fields
+        "estimatedRTT": initial_timeout,
+        "devRTT": initial_timeout / 2.0,
+        "timeoutInterval": initial_timeout,
     }
     g_uploads[chunk_hex] = session
     g_active_uploads += 1
@@ -173,8 +193,14 @@ def _start_upload_session(chunk_hex: str, addr: Tuple[str, int], sock: simsocket
     part = chunk_bytes[start:start + MAX_PAYLOAD]
     pkt = _pack_header(PktType.DATA, HEADER_LEN + len(part), seq=next_seq, ack=0) + part
     sock.sendto(pkt, addr)
+    now = time.time()
+
+    now = time.time()
     session["last_sent_seq"] = next_seq
-    session["last_sent_time"] = time.time()
+    session["last_sent_time"] = now
+    session["sent_times"][next_seq] = now
+    # timeoutInterval initially equals timeout (or estimated)
+    session["timeoutInterval"] = session["timeout"] if session["timeout"] else session["estimatedRTT"]
 
 
 def _send_data_segment_for_session(chunk_hex: str, sock: simsocket.SimSocket, seq: int = None) -> None:
@@ -193,8 +219,14 @@ def _send_data_segment_for_session(chunk_hex: str, sock: simsocket.SimSocket, se
     part = chunk_bytes[start:start + MAX_PAYLOAD]
     pkt = _pack_header(PktType.DATA, HEADER_LEN + len(part), seq=seq, ack=0) + part
     sock.sendto(pkt, addr)
-    session["last_sent_time"] = time.time()
+    now = time.time()
+    session["last_sent_time"] = now
     session["last_sent_seq"] = seq
+    # record last send time for this seq (used to compute SampleRTT upon ACK)
+    session["sent_times"][seq] = now
+    # If timeoutInterval is not defined, ensure there's a value
+    if "timeoutInterval" not in session or not session["timeoutInterval"]:
+        session["timeoutInterval"] = session.get("timeout", 0.5)
 
 
 def process_inbound_udp(sock: simsocket.SimSocket) -> None:
@@ -265,8 +297,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 g_candidates.setdefault(hhex, []).append(addr)
                 pkt_get = _pack_header(PktType.GET, HEADER_LEN + len(hbytes), seq=0, ack=0) + hbytes
                 sock.sendto(pkt_get, from_addr)
-                total_segs = (CHUNK_DATA_SIZE + MAX_PAYLOAD - 1) // MAX_PAYLOAD
-                g_downloading[addr] = {"chunk": hhex, "expected_seq": 1, "total_segs": total_segs}
+                g_downloading[addr] = {"chunk": hhex, "expected_seq": 1, "total_segs": None}
 
     # DENIED: ignore for now
     elif pkg_type == PktType.DENIED:
@@ -299,20 +330,40 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         seq_num = seq_h
 
         if seq_num == expected:
+            # append payload and ack
             g_receiving[chunk_hex] += data
             ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
             sock.sendto(ack_pkt, from_addr)
             session["expected_seq"] += 1
 
+            # Determine if this is the last segment:
+            payload_len = len(data)
+
+            # Case A: payload shorter than MAX_PAYLOAD => this is last segment
+            last_segment_received = payload_len < MAX_PAYLOAD
+
+            # Case B: fallback — if we've accumulated at least CHUNK_DATA_SIZE (original behavior)
             if len(g_receiving[chunk_hex]) >= CHUNK_DATA_SIZE:
+                last_segment_received = True
+
+            if last_segment_received:
+                # If last segment was shorter, compute exact total bytes:
+                total_bytes = len(g_receiving[chunk_hex])
                 out_file = g_output_map.get(chunk_hex, f"download_{chunk_hex}.fragment")
                 with open(out_file, "wb") as wf:
-                    pickle.dump({chunk_hex: g_receiving[chunk_hex][:CHUNK_DATA_SIZE]}, wf)
+                    # write exactly the received bytes (some tests expect exact length)
+                    pickle.dump({chunk_hex: g_receiving[chunk_hex][:total_bytes]}, wf)
+                # update local has_chunks with the exact bytes
                 sha1 = hashlib.sha1()
-                sha1.update(g_receiving[chunk_hex][:CHUNK_DATA_SIZE])
-                g_context.has_chunks[chunk_hex] = g_receiving[chunk_hex][:CHUNK_DATA_SIZE]
+                sha1.update(g_receiving[chunk_hex][:total_bytes])
+                g_context.has_chunks[chunk_hex] = g_receiving[chunk_hex][:total_bytes]
+                # cleanup
                 del g_receiving[chunk_hex]
-                del g_downloading[addr_key]
+                try:
+                    del g_downloading[addr_key]
+                except KeyError:
+                    pass
+
         else:
             ack_to_send = session["expected_seq"] - 1
             if ack_to_send < 0:
@@ -320,25 +371,77 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
             sock.sendto(ack_pkt, from_addr)
 
-    # ACK: sender side
+    # ACK: sender side (RDT handling)
     elif pkg_type == PktType.ACK:
         ack_num = ack_h
+        now = time.time()
+        # find session for this peer
         for chunk_hex, session in list(g_uploads.items()):
             if session["addr"] == (from_addr[0], from_addr[1]):
-                last_sent = session["last_sent_seq"]
-                total = session["total_segs"]
-                if ack_num == last_sent:
-                    if last_sent < total:
-                        next_seq = last_sent + 1
-                        _send_data_segment_for_session(chunk_hex, sock, seq=next_seq)
+                last_sent = session.get("last_sent_seq", 0)
+                total = session.get("total_segs", 0)
+                last_acked = session.get("last_acked", 0)
+                sent_times = session.get("sent_times", {})
+
+                # If this ACK advances the highest cumulative ACK (new information)
+                if ack_num > last_acked:
+                    # Compute SampleRTT if we have a send timestamp for acked seq
+                    if ack_num in sent_times:
+                        sampleRTT = now - sent_times[ack_num]
+                        # Update RTT estimates & dynamic timeoutInterval
+                        rdt_update_rtt(session, sampleRTT)
+
+                    # advance last_acked
+                    session["last_acked"] = ack_num
+                    # clear dup count for this ack_num (we have new progress)
+                    session["dup_ack_counts"].pop(ack_num, None)
+
+                    # Remove timestamps for all seq <= ack_num (they are acknowledged)
+                    for s in list(sent_times.keys()):
+                        if s <= ack_num:
+                            session["sent_times"].pop(s, None)
+
+                    # Reset the retransmission timer to avoid immediate retransmit
+                    session["last_sent_time"] = now
+
+                    # If ack acknowledges the last sent segment, either finish or send next
+                    if ack_num == last_sent:
+                        if last_sent < total:
+                            next_seq = last_sent + 1
+                            _send_data_segment_for_session(chunk_hex, sock, seq=next_seq)
+                            # ensure last_sent_time is up-to-date (send function sets it)
+                            session["last_sent_time"] = time.time()
+                        else:
+                            # finished sending this chunk
+                            try:
+                                del g_uploads[chunk_hex]
+                            except KeyError:
+                                pass
+                            if g_active_uploads > 0:
+                                g_active_uploads -= 1
                     else:
-                        try:
-                            del g_uploads[chunk_hex]
-                        except KeyError:
-                            pass
-                        if g_active_uploads > 0:
-                            g_active_uploads -= 1
+                        # ack acknowledges some earlier seq; we keep sending where we were
+                        if last_sent < total:
+                            next_seq = last_sent + 1
+                            _send_data_segment_for_session(chunk_hex, sock, seq=next_seq)
+                            session["last_sent_time"] = time.time()
+
+                # Duplicate ACK detected (ack_num == last_acked)
+                elif ack_num == last_acked:
+                    # handle duplicate ack counts and fast retransmit
+                    cnt = session.get("dup_ack_counts", {}).get(ack_num, 0) + 1
+                    session.setdefault("dup_ack_counts", {})[ack_num] = cnt
+                    # If reached 3 duplicate ACKs, fast retransmit once for the missing seq (ack_num + 1)
+                    if cnt >= 3 and (ack_num not in session.get("fast_retransmitted", set())):
+                        missing_seq = ack_num + 1
+                        if 1 <= missing_seq <= total:
+                            _send_data_segment_for_session(chunk_hex, sock, seq=missing_seq)
+                            session.setdefault("fast_retransmitted", set()).add(ack_num)
+                            # update timer after fast retransmit
+                            session["last_sent_time"] = time.time()
+                # else: older/out-of-order ack - ignore
                 break
+
 
     else:
         pass
@@ -398,7 +501,7 @@ def peer_run(context: PeerContext) -> None:
                 now = time.time()
                 for chunk_hex, session in list(g_uploads.items()):
                     last = session.get("last_sent_time", 0)
-                    timeout = session.get("timeout", getattr(g_context, "timeout", 0) or 0.5)
+                    timeout = rdt_get_timeout(session)
                     if now - last > timeout:
                         seq = session.get("last_sent_seq", 1)
                         _send_data_segment_for_session(chunk_hex, sock, seq=seq)
@@ -407,6 +510,56 @@ def peer_run(context: PeerContext) -> None:
         pass
     finally:
         sock.close()
+
+
+def rdt_update_rtt(session: dict, sampleRTT: float) -> None:
+    """Update EstimatedRTT / DevRTT / TimeoutInterval per given formulas."""
+    # use constants ALPHA, BETA defined earlier
+    prevEst = session.get("estimatedRTT", sampleRTT)
+    prevDev = session.get("devRTT", max(0.0, sampleRTT / 2.0))
+    est = (1 - ALPHA) * prevEst + ALPHA * sampleRTT
+    dev = (1 - BETA) * prevDev + BETA * abs(sampleRTT - est)
+    session["estimatedRTT"] = est
+    session["devRTT"] = dev
+    session["timeoutInterval"] = est + 4 * dev
+
+
+def rdt_get_timeout(session: dict) -> float:
+    """
+    Return the effective timeout for the session.
+    If a user-specified fixed timeout (-t) is set in g_context, prefer that.
+    Otherwise, return dynamic timeoutInterval computed from RTT.
+    """
+    if getattr(g_context, "timeout", 0):
+        # respect user-specified fixed timeout
+        return float(session.get("timeout", g_context.timeout))
+    return float(session.get("timeoutInterval", session.get("timeout", 0.5)))
+
+
+def rdt_handle_dup_ack(session: dict, ack_num: int, sock: simsocket.SimSocket, chunk_hex: str) -> None:
+    """
+    Maintain dup ack counts (per-round). When dup count reaches 3 for ack_num,
+    do a fast retransmit for missing_seq = ack_num + 1 (only once per ack_num).
+    """
+    last_acked = session.get("last_acked", 0)
+    # If ack advances beyond last_acked, reset dup counters for that ack
+    if ack_num > last_acked:
+        session["dup_ack_counts"].pop(ack_num, None)
+        session["last_acked"] = ack_num
+        return
+
+    # duplicate ack
+    cnt = session["dup_ack_counts"].get(ack_num, 0) + 1
+    session["dup_ack_counts"][ack_num] = cnt
+
+    # only trigger fast retransmit when count == 3 and not triggered before for this ack_num
+    if cnt >= 3 and (ack_num not in session.get("fast_retransmitted", set())):
+        missing_seq = ack_num + 1
+        total = session.get("total_segs", 0)
+        if 1 <= missing_seq <= total:
+            _send_data_segment_for_session(chunk_hex, sock, seq=missing_seq)
+            session.setdefault("fast_retransmitted", set()).add(ack_num)
+
 
 
 def main() -> None:
