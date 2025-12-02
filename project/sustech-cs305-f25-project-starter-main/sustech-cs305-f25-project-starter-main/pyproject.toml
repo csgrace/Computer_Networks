@@ -1,0 +1,16 @@
+[project]
+name = "cs305gxx"
+version = "0.1.0"
+description = "SUSTech CS305 Fall 2025 Group XX Project Starter"
+dependencies = [
+    # You CANNOT use unapproved external libraries except matplotlib in `src/` 
+    "matplotlib",
+
+    # If there are indeed new packages that need to be introduced for test, TA will update.
+    "pytest",
+    "networkx",
+]
+authors = [
+    { name = "Your Name", email = "you@example.com" }
+]
+requires-python = ">=3.12"
