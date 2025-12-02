@@ -87,6 +87,9 @@ MAX_WHOHAS_RETRIES: int = 3
 #窗口滑动
 WINDOW_SIZE = 10
 
+# 下载会话超时时间（用于检测发送端崩溃），单位：秒
+DOWNLOAD_TIMEOUT: float = 3.0
+
 # RTT params (as specified)
 ALPHA = 0.15
 BETA = 0.3
@@ -219,50 +222,32 @@ def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str, int]], soc
     if seq is None:
         seq = session.get("last_acked", 0) + 1
 
-    if seq > total_segs + 1:
+    # 不再发送 EOF 包，序号范围限制在 [1, total_segs]
+    if seq > total_segs:
         return
 
     print(f"DEBUG: Sending segment {seq}/{total_segs} to {addr}")
 
-    if seq <= total_segs:
-        # 发送数据段
-        start = (seq - 1) * MAX_PAYLOAD
-        end = start + MAX_PAYLOAD
-        if end > len(chunk_bytes):
-            end = len(chunk_bytes)
-        part = chunk_bytes[start:end]
+    # 发送数据段
+    start = (seq - 1) * MAX_PAYLOAD
+    end = start + MAX_PAYLOAD
+    if end > len(chunk_bytes):
+        end = len(chunk_bytes)
+    part = chunk_bytes[start:end]
 
-        # 检查数据段大小
-        if len(part) == 0:
-            print(f"DEBUG: ERROR: Empty segment at seq {seq}")
-            return
+    # 检查数据段大小
+    if len(part) == 0:
+        print(f"DEBUG: ERROR: Empty segment at seq {seq}")
+        return
 
-        pkt = _pack_header(PktType.DATA, HEADER_LEN + len(part), seq=seq, ack=0) + part
-        sock.sendto(pkt, addr)
+    pkt = _pack_header(PktType.DATA, HEADER_LEN + len(part), seq=seq, ack=0) + part
+    sock.sendto(pkt, addr)
 
-        # 更新会话状态
-        now = time.time()
-        session["last_sent_time"] = now
-        session["last_sent_seq"] = seq
-        session["sent_times"][seq] = now
-
-        # 如果是最后一个数据段，发送EOF
-        if seq == total_segs:
-            eof_seq = total_segs + 1
-            eof_pkt = _pack_header(PktType.DATA, HEADER_LEN, seq=eof_seq, ack=0)
-            sock.sendto(eof_pkt, addr)
-            session["last_sent_seq"] = eof_seq
-            session["sent_times"][eof_seq] = now
-            print(f"DEBUG: ✓ Sent EOF for {session_key[0]}")
-
-    elif seq == total_segs + 1:
-        # 重传EOF包
-        eof_pkt = _pack_header(PktType.DATA, HEADER_LEN, seq=seq, ack=0)
-        sock.sendto(eof_pkt, addr)
-        now = time.time()
-        session["last_sent_time"] = now
-        session["last_sent_seq"] = seq
-        session["sent_times"][seq] = now
+    # 更新会话状态
+    now = time.time()
+    session["last_sent_time"] = now
+    session["last_sent_seq"] = seq
+    session["sent_times"][seq] = now
 
     # 设置超时间隔
     if "timeoutInterval" not in session or not session["timeoutInterval"]:
@@ -408,17 +393,8 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         if chunk_hex not in g_receiving:
             g_receiving[chunk_hex] = b""
 
+        # 不再使用 0 长度 DATA 作为 EOF；若出现视为异常，直接丢弃
         if payload_len == 0:
-            # 发送EOF的ACK
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
-            sock.sendto(ack_pkt, from_addr)
-
-            # 记录接收到的数据大小
-            received_size = len(g_receiving.get(chunk_hex, b""))
-
-            # 检查数据完整性
-            if received_size >= CHUNK_DATA_SIZE:
-                _complete_download(chunk_hex, received_size, session_key, from_addr, sock, seq_num)
             return
 
         if seq_num == expected:
@@ -474,67 +450,28 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 session["send_base"] = ack_num + 1
                 session["last_sent_time"] = now
 
-                # 滑动窗口：发送新的数据段
-                while next_seq_num < send_base + window_size and next_seq_num <= total_segs:
-                    print(f"DEBUG: Sending next segment: {next_seq_num}")
-                    _send_data_segment_for_session(session_key, sock, seq=next_seq_num)
-                    session["next_seq_num"] = next_seq_num + 1
-                    next_seq_num += 1
-
-                # 检查是否所有数据段都已发送并确认
-                if ack_num == total_segs:
-                    # 所有数据段已确认，发送EOF
-                    print(f"DEBUG: All data segments ACKed, sending EOF")
-                    eof_seq = total_segs + 1
-                    _send_data_segment_for_session(session_key, sock, seq=eof_seq)
-                elif ack_num == total_segs + 1:
-                    # EOF确认，完成上传
-                    print(f"DEBUG: 🎉 EOF ACK received, upload completed!")
+                # 如果已经确认到最后一个数据段，则认为上传完成，关闭会话
+                if ack_num >= total_segs:
+                    print(f"DEBUG: 🎉 All data segments ACKed for {chunk_hex}, upload completed!")
                     try:
                         del g_uploads[session_key]
                         if g_active_uploads > 0:
                             g_active_uploads -= 1
                     except KeyError:
                         pass
+                    continue
 
-    # 无滑动窗口 可通过test2
-    # elif pkg_type == PktType.ACK:
-    #     ack_num = ack_h
-    #     now = time.time()
-    #
-    #     for session_key, session in list(g_uploads.items()):
-    #         chunk_hex, sess_addr = session_key
-    #         if sess_addr != (from_addr[0], from_addr[1]):
-    #             continue
-    #
-    #         total_segs = session.get("total_segs", 0)
-    #         last_acked = session.get("last_acked", 0)
-    #
-    #         print(f"DEBUG: ACK received: {ack_num}, last_acked: {last_acked}")
-    #
-    #         # 重要修复：处理重复ACK（快速重传）
-    #         if ack_num == last_acked and ack_num > 0:
-    #             # 重复ACK，可能丢包了，进行快速重传
-    #             print(f"DEBUG: 🔄 DUPLICATE ACK {ack_num}, fast retransmit")
-    #             next_seq = ack_num + 1
-    #             _send_data_segment_for_session(session_key, sock, seq=next_seq)
-    #
-    #         elif ack_num > last_acked:
-    #             # 正常ACK进展
-    #             session["last_acked"] = ack_num
-    #             session["last_sent_time"] = now
-    #
-    #             # 发送下一个数据段
-    #             if ack_num < total_segs:
-    #                 next_seq = ack_num + 1
-    #                 print(f"DEBUG: Normal ACK, sending next segment: {next_seq}")
-    #                 _send_data_segment_for_session(session_key, sock, seq=next_seq)
-    #             elif ack_num == total_segs:
-    #                 # 所有数据段已确认，发送EOF
-    #                 print(f"DEBUG: All data segments ACKed, sending EOF")
-    #                 eof_seq = total_segs + 1
-    #                 _send_data_segment_for_session(session_key, sock, seq=eof_seq)
-
+                # 滑动窗口：发送新的数据段
+                while next_seq_num < send_base + window_size and next_seq_num <= total_segs:
+                    print(f"DEBUG: Sending next segment: {next_seq_num}")
+                    _send_data_segment_for_session(session_key, sock, seq=next_seq_num)
+                    session["next_seq_num"] = next_seq_num + 1
+                    next_seq_num += 1
+            elif ack_num == last_acked:
+                # duplicate ACK, fast retransmit
+                print(f"DEBUG: 🔄 DUPLICATE ACK {ack_num}, fast retransmit")
+                next_seq = ack_num + 1
+                _send_data_segment_for_session(session_key, sock, seq=next_seq)
     else:
         pass
 
@@ -583,9 +520,9 @@ def peer_run(context: PeerContext) -> None:
                 now = time.time()
 
                 # 每2秒强制检查一次
-                if now - last_force_check > 2.0:
-                    last_force_check = now
-                    _force_complete_transfer()
+                # if now - last_force_check > 2.0:
+                #     last_force_check = now
+                #     _force_complete_transfer()
 
                 # 超时重传检查
                 for session_key, session in list(g_uploads.items()):
@@ -594,19 +531,27 @@ def peer_run(context: PeerContext) -> None:
                     if now - last > timeout:
                         last_seq = session.get("last_sent_seq", 1)
                         _send_data_segment_for_session(session_key, sock, seq=last_seq)
+
+                # 下载会话超时检查（检测发送端崩溃）
+                # 只在用户未指定超时时间时检查，否则使用用户指定的超时时间
+                if not getattr(g_context, "timeout", 0):
+                    for session_key, session in list(g_downloading.items()):
+                        last_recv = session.get("last_ack_time", session.get("start_time", 0))
+                        if now - last_recv > DOWNLOAD_TIMEOUT:
+                            _handle_download_timeout(session_key, sock)
     except KeyboardInterrupt:
         pass
     finally:
         sock.close()
 
 
-def _force_complete_transfer():
-    """禁用强制完成"""
-    pass
+# def _force_complete_transfer():
+#     """禁用强制完成"""
+#     pass
 
 
-if int(time.time()) % 10 == 0:  # 每10秒检查一次进行强制传输
-    _force_complete_transfer()
+# if int(time.time()) % 10 == 0:  # 每10秒检查一次进行强制传输
+#     _force_complete_transfer()
 
 def rdt_update_rtt(session: dict, sampleRTT: float) -> None:
     """Update EstimatedRTT / DevRTT / TimeoutInterval per given formulas."""
@@ -668,6 +613,75 @@ def _retry_whohas(sock: simsocket.SimSocket) -> None:
         # 如果还有重试次数，安排下一次重试
         if g_whohas_retry_count < MAX_WHOHAS_RETRIES:
             threading.Timer(3.0, _retry_whohas, [sock]).start()  # 3秒后再次重试
+
+
+def _handle_download_timeout(session_key: Tuple[Tuple[str, int], str], sock: simsocket.SimSocket) -> None:
+    """
+    下载端检测到某个发送端长时间无响应（可能崩溃）时：
+    1. 清空当前 chunk 的已接收数据；
+    2. 将该发送端从候选列表中移除；
+    3. 若还有其它候选 peer，则向其重新发送 GET；
+    4. 若没有候选，则重新对该 chunk 发送 WHOHAS。
+    """
+    global g_downloading, g_receiving, g_candidates, g_context
+
+    session = g_downloading.pop(session_key, None)
+    if not session:
+        return
+
+    addr, chunk_hex = session_key
+    print(f"DEBUG: Download timeout for chunk {chunk_hex} from {addr}, will retry with another peer if possible")
+
+    # 1. 清空该 chunk 已接收的数据
+    if chunk_hex in g_receiving:
+        g_receiving[chunk_hex] = b""
+
+    # 2. 从候选列表中移除当前发送端
+    cand_list = g_candidates.get(chunk_hex, [])
+    cand_list = [c for c in cand_list if c != addr]
+    g_candidates[chunk_hex] = cand_list
+
+    # 3. 若还有其它候选 peer，直接向其中一个发送 GET 并创建新的下载会话
+    if cand_list:
+        new_addr = cand_list[0]
+        try:
+            payload = _hex_to_bytes(chunk_hex)
+        except ValueError:
+            # 非法 hash，放弃
+            return
+
+        pkt_get = _pack_header(PktType.GET, HEADER_LEN + len(payload), seq=0, ack=0) + payload
+        sock.sendto(pkt_get, new_addr)
+
+        g_downloading[(new_addr, chunk_hex)] = {
+            "chunk": chunk_hex,
+            "expected_seq": 1,
+            "total_segs": None,
+            "start_time": time.time(),
+            "last_ack_time": time.time(),
+        }
+        print(f"DEBUG: Retry chunk {chunk_hex} from backup peer {new_addr}")
+        return
+
+    # 4. 没有其它候选 peer，重新对该 chunk 发送 WHOHAS，等待新的 IHAVE
+    try:
+        payload = _hex_to_bytes(chunk_hex)
+    except ValueError:
+        return
+
+    pkt = _pack_header(PktType.WHOHAS, HEADER_LEN + len(payload), seq=0, ack=0) + payload
+    for p in g_context.peers:
+        try:
+            pid = int(p[0])
+            if pid == g_context.identity:
+                continue
+            peer_ip = p[1]
+            peer_port = int(p[2])
+            sock.sendto(pkt, (peer_ip, peer_port))
+        except Exception:
+            continue
+
+    print(f"DEBUG: No backup peer for chunk {chunk_hex}, re-broadcast WHOHAS")
 
 def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, from_addr: Tuple,
                        sock: simsocket.SimSocket, seq_num: int):
