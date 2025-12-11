@@ -75,7 +75,6 @@ class PingTool:
                 return ipaddress.IPv4Network("224.0.0.0/4").__contains__(addr)
             else:
                 addr = ipaddress.IPv6Address(ip)
-                # FF00::/8 is multicast
                 return str(addr).lower().startswith("ff")
         except ValueError:
             return False
@@ -99,11 +98,10 @@ class PingTool:
         if not self.is_multicast_address(ip, self.IPv4):
             raise ValueError("Not a valid IPv4 multicast address")
         maddr = int(ipaddress.IPv4Address(ip))
-        # Lower 23 bits map to 01:00:5e:xx:xx:xx, drop highest bit of first octet per RFC 1112
         low_23 = maddr & 0x7FFFFF
         mac = [
             0x01, 0x00, 0x5e,
-            (low_23 >> 16) & 0x7F,  # only 7 bits
+            (low_23 >> 16) & 0x7F,
             (low_23 >> 8) & 0xFF,
             low_23 & 0xFF
         ]
@@ -127,7 +125,6 @@ class PingTool:
         if not self.is_multicast_address(ip, self.IPv6):
             raise ValueError("Not a valid IPv6 multicast address")
         packed = socket.inet_pton(socket.AF_INET6, ip)
-        # Per RFC 2464: 33:33:xx:xx:xx:xx using lower 32 bits of address
         last32 = packed[-4:]
         mac = [0x33, 0x33, last32[0], last32[1], last32[2], last32[3]]
         return ":".join(f"{b:02x}" for b in mac)
@@ -147,7 +144,6 @@ class PingTool:
                 if addr.family == socket.AF_INET and addr.address == target_ip:
                     return iface
                 if addr.family == socket.AF_INET6:
-                    # Strip zone id if present
                     a = addr.address.split("%")[0]
                     if a == target_ip:
                         return iface
@@ -220,7 +216,7 @@ class PingTool:
             for i in range(count):
                 # TODO：Implement IPv4 unicast packet sending
                 # Construct ICMP Echo Request packet
-                icmp_type = 0
+                icmp_type = 8
                 icmp_code = 0
                 icmp_checksum = 0
                 icmp_id = 0x1234
