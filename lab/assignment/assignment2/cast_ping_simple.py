@@ -50,7 +50,6 @@ class PingTool:
                         and int(addr) <= int(ipaddress.IPv4Address("223.255.255.255")))
             else:
                 addr = ipaddress.IPv6Address(ip)
-                # Global unicast 2000::/3 (2000:: - 3fff:ffff:... per assignment)
                 return ipaddress.IPv6Network("2000::/3").supernet(new_prefix=3).__contains__(
                     addr) or ipaddress.IPv6Network("2000::/3").__contains__(addr)
         except ValueError:
@@ -162,18 +161,13 @@ class PingTool:
         """
         try:
             if ip_version == self.IPv6:
-                # Create IPv6 raw socket
                 sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
-                # Allow IPv6 socket to receive its own multicast packets
                 if is_multicast:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 1)
             else:
-                # Create IPv4 raw socket
                 sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-                # Allow IPv4 socket to send multicast packets
                 if is_multicast:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
             return sock
         except PermissionError:
             print("Error: Administrator privileges required to create raw socket")
@@ -183,7 +177,6 @@ class PingTool:
             sys.exit(1)
 
     def _internet_checksum(self, data):
-        # Standard one's complement 16-bit checksum
         if len(data) % 2:
             data += b'\x00'
         s = 0
@@ -193,7 +186,6 @@ class PingTool:
         return (~s) & 0xffff
 
     def _icmpv6_checksum(self, src_ip, dst_ip, icmp_payload):
-        # IPv6 pseudo header: src(16) dst(16) length(4) zero(3) next header(1)
         src = socket.inet_pton(socket.AF_INET6, src_ip)
         dst = socket.inet_pton(socket.AF_INET6, dst_ip)
         length = struct.pack("!I", len(icmp_payload))
@@ -215,22 +207,16 @@ class PingTool:
                 sock.bind((src_addr, 0))
             for i in range(count):
                 # TODO：Implement IPv4 unicast packet sending
-                # Construct ICMP Echo Request packet
                 icmp_type = 8
                 icmp_code = 0
                 icmp_checksum = 0
                 icmp_id = 0x1234
-                # NOTE: please do not modify the value of 'icmp_seq',for the values of other fields, please specify them according to the Protocol.
                 icmp_seq = i
-                # Construct ICMP header (without checksum)
                 header = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
                 payload = b"CS305Ping-" + struct.pack("!d", time.time())
-                # Calculate checksum
                 icmp_checksum = self._internet_checksum(header + payload)
-                # Reconstruct ICMP header with checksum and send
                 packet = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq) + payload
                 sock.sendto(packet, (dst_addr, 0))
-                # Note: please do not remove print code, as it is used to validate the checksum of ICMP you calculated
                 print(f"Sent ICMPv4 Echo Request to {dst_addr} (Checksum: {icmp_checksum:04x})- Packet {i + 1}")
                 time.sleep(1)
 
@@ -252,34 +238,23 @@ class PingTool:
         try:
             sock = self.create_raw_socket(self.IPv6)
             if src_addr:
-                # sock.bind((src_addr, 0))
                 sock.bind((src_addr, 0, 0, 0))
             # TODO：Implement IPv6 unicast packet sending
             for i in range(count):
-                # Construct ICMPv6 Echo Request packet
-                icmp_type = 128  # Echo Request
+                icmp_type = 128
                 icmp_code = 0
                 icmp_checksum = 0
                 icmp_id =  0x1234
-                # NOTE: please do not modify the value of 'icmp_seq',for the values of other fields, please specify them according to the Protocol.
                 icmp_seq = i
 
-                # Construct ICMPv6 header (without checksum)
                 header = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
                 payload = b"CS305Ping6-" + struct.pack("!d", time.time())
 
-                # For ICMPv6, checksum calculation includes IPv6 pseudo header
-                # Calculate checksum
                 icmp_checksum = self._icmpv6_checksum(src_addr if src_addr else "::1", dst_addr, header + payload)
-
-                # Reconstruct ICMP header with checksum and send
                 packet = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq) + payload
                 sock.sendto(packet, (dst_addr, 0, 0, 0))
-
-                # Note: please do not remove print code, as it is used to validate the checksum of ICMP you calculated
                 print(f"Sent ICMPv6 Echo Request to {dst_addr} (Checksum: {icmp_checksum:04x})- Packet {i + 1}")
                 time.sleep(1)
-
             sock.close()
         except Exception as e:
             print(f"Error sending IPv6 unicast packets: {e}")
@@ -312,21 +287,16 @@ class PingTool:
                 sock.bind((src_addr, 0))
             # TODO：Implement IPv4 multicast packet sending
             for i in range(count):
-                # Construct ICMP Echo Request packet
                 icmp_type = 8
                 icmp_code = 0
                 icmp_checksum = 0
                 icmp_id = 0x1234
-                # NOTE: please do not modify the value of 'icmp_seq',for the values of other fields, please specify them according to the Protocol.
                 icmp_seq = i
-
                 payload = b"CS305MIPv4-" + struct.pack("!d", time.time())
                 header = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
 
-                # Calculate checksum
                 icmp_checksum = self._internet_checksum(header + payload)
 
-                # Reconstruct ICMP header with checksum and send
                 packet = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq) + payload
                 sock.sendto(packet, (dst_addr, 0))
 
@@ -371,7 +341,6 @@ class PingTool:
                     print(f"Warning: Alternative method also failed: {e2}")
             # TODO：Implement IPv6 multicast packet sending
             for i in range(count):
-                # Construct ICMPv6 Echo Request packet
                 icmp_type = 128
                 icmp_code = 0
                 icmp_checksum = 0
@@ -382,12 +351,9 @@ class PingTool:
                 payload = b"CS305MIPv6-" + struct.pack("!d", time.time())
                 header = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
 
-                # For ICMPv6, checksum calculation includes IPv6 pseudo header
-                # Calculate checksum
                 src_for_checksum = src_addr if src_addr else "::1"
                 icmp_checksum = self._icmpv6_checksum(src_for_checksum, dst_addr, header + payload)
 
-                # Reconstruct ICMP header with checksum and send
                 packet = struct.pack("!BBHHH", icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq) + payload
                 sock.sendto(packet, (dst_addr, 0, 0, 0))
 
@@ -427,13 +393,11 @@ class PingTool:
             count (int): Number of packets to send
             mode (str): Send mode (unicast or multicast)
         """
-        # Validate destination address
         ip_version = self.validate_ip(dst_addr)
         if ip_version is None:
             print(f"Error: Invalid IP address {dst_addr}")
             return
 
-        # Validate source address (if provided)
         if src_addr:
             src_version = self.validate_ip(src_addr)
             if src_version is None:
@@ -443,7 +407,6 @@ class PingTool:
                 print("Error: Source and destination IP versions must match")
                 return
 
-        # If multicast mode, validate multicast address
         if mode == "multicast":
             if not self.is_multicast_address(dst_addr, ip_version):
                 print(f"Error: {dst_addr} is not a valid multicast address")
@@ -452,7 +415,6 @@ class PingTool:
                 else:
                     print("IPv6 multicast addresses should start with FF00::/8 prefix")
                 return
-        # If unicast mode, validate unicast address
         if mode == "unicast":
             if not self.is_unicast_address(dst_addr, ip_version):
                 print(f"Error: {dst_addr} is not a valid unicast address")
@@ -464,16 +426,15 @@ class PingTool:
 
         print(f"Pinging {dst_addr} with {count} packets:")
 
-        # Send packets based on address type and mode
         if ip_version == self.IPv4:
             if mode == "unicast":
                 self.send_ipv4_unicast(src_addr, dst_addr, count)
-            else:  # multicast
+            else:
                 self.send_ipv4_multicast(src_addr, dst_addr, count)
-        else:  # IPv6
+        else:
             if mode == "unicast":
                 self.send_ipv6_unicast(src_addr, dst_addr, count)
-            else:  # multicast
+            else:
                 self.send_ipv6_multicast(src_addr, dst_addr, count)
 
 
@@ -489,10 +450,7 @@ def main():
                         help="Send mode (unicast or multicast)", default="unicast")
 
     args = parser.parse_args()
-
-    # Create PingTool instance
     ping_tool = PingTool()
-    # Run
     ping_tool.run(args.source, args.destination, args.count, args.mode)
 
 
