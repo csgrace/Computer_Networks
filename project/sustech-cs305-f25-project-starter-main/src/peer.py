@@ -8,7 +8,7 @@ import argparse
 import pickle
 import time
 import threading
-
+from queue import Queue, Empty
 from typing import Dict, List, Tuple
 
 # Ensure project root in sys.path so "utils" can be imported regardless of cwd
@@ -32,18 +32,22 @@ The given function is only one possible design, you are not required to follow i
 We allow you to use better code design that conforms to best practices.
 But ensure that your program's entry point is `peer.py` .
 """
+# wsl
 # python3 -m utils.make_data ./example/ex_file.tar ./example/data1.fragment 4 1,2
 # python3 -m utils.make_data ./example/ex_file.tar ./example/data2.fragment 4 3,4
 # sed -n '3p' master.chunkhash > example/download.chunkhash
 # perl utils/hupsim.pl -m example/ex_topo.map -n example/ex_nodes_map -p 50305 -v 2
 
+# wsl
 # export SIMULATOR="127.0.0.1:50305"
 # python3 -m example.demo_sender -p example/ex_nodes_map -c example/data2.fragment -m 1 -i 2 -v 3
 
+# wsl
 # export SIMULATOR="127.0.0.1:50305"
 # python3 -m example.demo_receiver -p example/ex_nodes_map -c example/data1.fragment -m 1 -i 1 -v 3
 # DOWNLOAD example/download.chunkhash example/test.fragment
 
+# wsl
 # pytest test/test_01_basic_handshaking.py
 # pytest test/test_02_basic_transfer.py
 # pytest test/test_03_basic_concurrency.py
@@ -127,14 +131,15 @@ def _pack_header(ptype: int, plen: int, seq: int = 0, ack: int = 0) -> bytes:
 def process_download(
         sock: simsocket.SimSocket, chunk_file: str, output_file: str
 ) -> None:
-    global g_want_chunks, g_receiving, g_candidates, g_output_map, g_downloading
+    global g_want_chunks, g_receiving, g_candidates, g_output_map, g_downloading, g_whohas_retry_count
 
+    g_whohas_retry_count = 0
     g_want_chunks = []
     g_candidates = {}
     g_receiving = {}
     g_output_map = {}
     g_downloading = {}
-    g_whohas_retry_count = 0
+
 
     try:
         with open(chunk_file, "r") as fh:
@@ -193,36 +198,52 @@ def _start_upload_session(chunk_hex: str, addr: Tuple[str, int], sock: simsocket
     else:
         initial_timeout = 0.5
 
+    # Congestion control initialization (Tahoe-style)
+    cc_state = "slow_start"  # "slow_start" or "congestion_avoidance"
+    ssthresh = 64
+    cwnd = 1
+    dupACKcount = 0
+
     session = {
         "addr": addr,
         "chunk_bytes": chunk_bytes,
-        "last_sent_seq": 0,
         "total_segs": total_segs,
+
+        # RDT / timing
+        "last_sent_seq": 0,
         "last_sent_time": 0.0,
         "timeout": initial_timeout,
         "sent_times": {},
+
+        # ACK / seq window
         "last_acked": 0,
-        "dup_ack_counts": {},
-        "fast_retransmitted": set(),
+        "send_base": 1,
+        "next_seq_num": 1,
+
+        # RTT estimation
         "estimatedRTT": initial_timeout,
         "devRTT": initial_timeout / 2.0,
         "timeoutInterval": initial_timeout,
-        "window_size": WINDOW_SIZE,
-        "send_base": 1,
-        "next_seq_num": 1,
+
+        # Congestion control fields
+        "cc_state": cc_state,
+        "ssthresh": ssthresh,
+        "cwnd": cwnd,  # packets
+        "dupACKcount": dupACKcount,
+        "fast_retransmitted": set(),
+
+        # "window_size": WINDOW_SIZE,
+
     }
 
     key = (chunk_hex, addr)
     g_uploads[key] = session
     g_active_uploads += 1
 
-    # 使用流水线发送初始窗口的数据包
-    initial_burst = min(WINDOW_SIZE, total_segs)
-    for seq in range(1, initial_burst + 1):
-        _send_data_segment_for_session(key, sock, seq=seq)
-        session["next_seq_num"] = seq + 1
+    # Send up to cwnd initial segments
+    _send_within_cwnd(key, sock)
 
-    print(f"DEBUG: Upload session started for {chunk_hex}, sent {initial_burst} initial segments")
+    print(f"DEBUG: Upload session started for {chunk_hex}, cwnd={cwnd}, ssthresh={ssthresh}, total_segs={total_segs}")
 
 def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket,
                                    seq: int = None) -> None:
@@ -240,17 +261,15 @@ def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str, int]], soc
     if seq is None:
         seq = session.get("last_acked", 0) + 1
 
-    # 不再发送 EOF 包，序号范围限制在 [1, total_segs]
-    if seq > total_segs:
+    # 不再发送 EOF 包，Bound seq to [1, total_segs]
+    if seq > total_segs or seq < 1:
         return
 
     print(f"DEBUG: Sending segment {seq}/{total_segs} to {addr}")
 
     # 发送数据段
     start = (seq - 1) * MAX_PAYLOAD
-    end = start + MAX_PAYLOAD
-    if end > len(chunk_bytes):
-        end = len(chunk_bytes)
+    end = min(start + MAX_PAYLOAD, len(chunk_bytes))
     part = chunk_bytes[start:end]
 
     # 检查数据段大小
@@ -271,6 +290,131 @@ def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str, int]], soc
     if "timeoutInterval" not in session or not session["timeoutInterval"]:
         session["timeoutInterval"] = session.get("timeout", 0.5)
 
+def _send_within_cwnd(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket) -> None:
+    """
+    Send new segments while inflight < cwnd.
+    inflight = next_seq_num - send_base
+    """
+    session = g_uploads.get(session_key)
+    if not session:
+        return
+
+    total_segs = session["total_segs"]
+    send_base = session["send_base"]
+    next_seq_num = session["next_seq_num"]
+    cwnd = session.get("cwnd", 1)
+
+    while (next_seq_num - send_base) < min(cwnd, WINDOW_SIZE) and next_seq_num <= total_segs:
+        _send_data_segment_for_session(session_key, sock, seq=next_seq_num)
+        session["next_seq_num"] = next_seq_num + 1
+        next_seq_num += 1
+
+def _on_new_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket, ack_num: int, now: float) -> None:
+    """
+    Handle new ACK that advances last_acked. Apply cc rules and send within cwnd.
+    """
+    global g_active_uploads
+    session = g_uploads.get(session_key)
+    if not session:
+        return
+
+    total_segs = session["total_segs"]
+    last_acked = session.get("last_acked", 0)
+    send_base = session.get("send_base", 1)
+
+    # RTT sample: from sent_times[ack_num]
+    sent_times = session.get("sent_times", {})
+    if ack_num in sent_times:
+        sampleRTT = max(0.0, now - sent_times[ack_num])
+        rdt_update_rtt(session, sampleRTT)
+
+    # Advance acked window
+    session["last_acked"] = ack_num
+    session["send_base"] = ack_num + 1
+
+    # Congestion control transitions + growth
+    cc_state = session.get("cc_state", "slow_start")
+    cwnd = session.get("cwnd", 1)
+    ssthresh = session.get("ssthresh", 64)
+
+    # This ACK advances the round; per spec we can reset dupACKcount for new round,
+    # BUT do not reset when fast retransmit just happened (spec says not reset after FR);
+    # We interpret "per-round" as reset when progress occurs.
+    session["dupACKcount"] = 0
+    session["fast_retransmitted"]. discard(ack_num + 1)  # optional cleanup
+
+    if cc_state == "slow_start":
+        # cwnd += 1 per new ACK
+        cwnd += 1
+        session["cwnd"] = cwnd
+        # Transition if cwnd >= ssthresh
+        if cwnd >= ssthresh:
+            session["cc_state"] = "congestion_avoidance"
+            print(f"DEBUG: CC transition to congestion_avoidance, cwnd={cwnd}, ssthresh={ssthresh}")
+    else:
+        # Congestion Avoidance: cwnd += floor(1/cwnd) per new ACK
+        inc = max(1, int(1 / max(cwnd, 1)))
+        cwnd += inc
+        session["cwnd"] = max(cwnd, 1)
+
+    # Completion check
+    if ack_num >= total_segs:
+        print(f"DEBUG: 🎉 All data segments ACKed for {session_key[0]}, upload completed! cwnd={session['cwnd']}")
+        try:
+            del g_uploads[session_key]
+            g_active_uploads = max(0, g_active_uploads - 1)
+        except KeyError:
+            pass
+        return
+
+    # Transmit new packets allowed by increased cwnd
+    _send_within_cwnd(session_key, sock)
+
+def _on_duplicate_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket, ack_num: int) -> None:
+    """
+    Handle duplicate ACK. Increment dupACKcount and fast retransmit once per seq when dupACKcount==3.
+    """
+    session = g_uploads.get(session_key)
+    if not session:
+        return
+
+    dup = session.get("dupACKcount", 0) + 1
+    session["dupACKcount"] = dup
+    print(f"DEBUG: DUP ACK {ack_num}, dupACKcount={dup}")
+
+    # Fast retransmit once when dupACKcount==3
+    next_seq = ack_num + 1
+    if dup == 3 and next_seq not in session["fast_retransmitted"]:
+        session["fast_retransmitted"].add(next_seq)
+        print(f"DEBUG: 🚀 Fast retransmit seq={next_seq} (Tahoe), set ssthresh=max(floor(cwnd/2),2), cwnd=1")
+
+        # Tahoe-style reaction
+        cwnd = session.get("cwnd", 1)
+        ssthresh = max(int(cwnd / 2), 2)
+        session["ssthresh"] = ssthresh
+        session["cwnd"] = 1
+        session["cc_state"] = "slow_start"
+
+        # Retransmit the presumed lost packet
+        _send_data_segment_for_session(session_key, sock, seq=next_seq)
+        session["send_base"] = ack_num + 1
+        session["next_seq_num"] = max(session.get("next_seq_num", ack_num + 1), ack_num + 2)
+        # Do NOT reset dupACKcount after fast retransmit (per spec)
+
+def _stdin_reader(cmd_queue):
+    """Blockingly read lines from stdin and put them into the queue."""
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if line == "":
+                # No data right now (EOF on this read), wait a bit and retry.
+                # This prevents the reader thread from exiting and keeps stdin open.
+                time.sleep(0.01)
+                continue
+            cmd_queue.put(line)
+    except Exception:
+        # 静默退出，让主循环自己结束
+        pass
 
 def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     """
@@ -323,7 +467,6 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             pkt_denied = _pack_header(PktType.DENIED, HEADER_LEN, seq=0, ack=0)
             sock.sendto(pkt_denied, from_addr)
 
-    # IHAVE -> send GET and create downloading session
     # IHAVE -> send GET and create downloading session
     elif pkg_type == PktType.IHAVE:
         peer_has_chunks = []
@@ -387,8 +530,6 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 _start_upload_session(requested_hex, (from_addr[0], from_addr[1]), sock)
 
     # DATA: receiving side
-    # DATA: receiving side
-    # DATA: receiving side
     elif pkg_type == PktType.DATA:
         addr_key = (from_addr[0], from_addr[1])
         # 查找对应的下载会话
@@ -406,42 +547,45 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         chunk_hex = session["chunk"]
         expected = session["expected_seq"]
         seq_num = seq_h
-        payload_len = len(data)
+        payload = data
+
+        # ⭐ 忽略空数据包
+        if len(payload) == 0:
+            print(f"DEBUG: ⚠️ Ignoring empty DATA packet seq={seq_num}")
+            return
+
+        # 初始化 total_segs
+        if session["total_segs"] is None:
+            session["total_segs"] = (CHUNK_DATA_SIZE + MAX_PAYLOAD - 1) // MAX_PAYLOAD
+            print(f"DEBUG:  Initialized total_segs={session['total_segs']} for chunk {chunk_hex}")
 
         if chunk_hex not in g_receiving:
             g_receiving[chunk_hex] = b""
 
-        # 不再使用 0 长度 DATA 作为 EOF；若出现视为异常，直接丢弃
-        if payload_len == 0:
-            return
-
         if seq_num == expected:
-            # 追加有效载荷并发送ACK
-            current_size = len(g_receiving[chunk_hex])
-            g_receiving[chunk_hex] += data
-            new_size = len(g_receiving[chunk_hex])
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
-            sock.sendto(ack_pkt, from_addr)
-            session["expected_seq"] += 1
+            # 正确的序列号,追加数据
+            g_receiving[chunk_hex] += payload
             session["last_ack_time"] = time.time()
 
-            # 检查是否达到预期文件大小（512KB）
-            if new_size >= CHUNK_DATA_SIZE:
-                _complete_download(chunk_hex, new_size, session_key, from_addr, sock, seq_num)
-
-        else:
-            # 乱序包，发送期望序列号-1的ACK
-            ack_to_send = session["expected_seq"] - 1
-            if ack_to_send < 0:
-                ack_to_send = 0
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
+            # 发送ACK
+            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
             sock.sendto(ack_pkt, from_addr)
 
-    # ACK: sender side (RDT handling)
-    # ACK (sender side)
-    # ACK: sender side (RDT handling)
-    # ACK: sender side (RDT handling)
-    # ACK: sender side (RDT handling)
+            # 更新期望序列号
+            session["expected_seq"] = expected + 1
+
+            # ⭐ 检查是否是最后一个分片
+            if seq_num == session["total_segs"]:
+                print(f"DEBUG: 📦 Received last segment {seq_num}/{session['total_segs']} for {chunk_hex}")
+                _complete_download(chunk_hex, len(g_receiving[chunk_hex]), session_key, from_addr, sock, seq_num)
+        else:
+            # 乱序或重复,发送累积ACK
+            ack_to_send = max(0, expected - 1)
+            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
+            sock.sendto(ack_pkt, from_addr)
+            print(f"DEBUG: Out-of-order DATA:  got seq={seq_num}, expected={expected}, sent ACK={ack_to_send}")
+
+    # ACK: sender side (RDT + Tahoe CC)
 
     # 有滑动窗口 可通过test3
     elif pkg_type == PktType.ACK:
@@ -456,45 +600,20 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
 
             total_segs = session.get("total_segs", 0)
             last_acked = session.get("last_acked", 0)
-            send_base = session.get("send_base", 1)
-            next_seq_num = session.get("next_seq_num", 1)
-            window_size = session.get("window_size", WINDOW_SIZE)
 
-            print(f"DEBUG: ACK received: {ack_num}, last_acked: {last_acked}, total_segs: {total_segs}")
+            print(
+                f"DEBUG: ACK received: {ack_num}, last_acked: {last_acked}, total_segs: {total_segs}, cwnd={session.get('cwnd', 1)}, ssthresh={session.get('ssthresh', 64)}, cc_state={session.get('cc_state', 'slow_start')}")
 
             if ack_num > last_acked:
-                # new ACK progress
-                session["last_acked"] = ack_num
-                session["send_base"] = ack_num + 1
-                session["last_sent_time"] = now
-
-                # 如果已经确认到最后一个数据段，则认为上传完成，关闭会话
-                if ack_num >= total_segs:
-                    print(f"DEBUG: 🎉 All data segments ACKed for {chunk_hex}, upload completed!")
-                    try:
-                        del g_uploads[session_key]
-                        if g_active_uploads > 0:
-                            g_active_uploads -= 1
-                    except KeyError:
-                        pass
-                    continue
-
-                # 滑动窗口：发送新的数据段
-                while next_seq_num < send_base + window_size and next_seq_num <= total_segs:
-                    print(f"DEBUG: Sending next segment: {next_seq_num}")
-                    _send_data_segment_for_session(session_key, sock, seq=next_seq_num)
-                    session["next_seq_num"] = next_seq_num + 1
-                    next_seq_num += 1
-            elif ack_num == last_acked:
-                # duplicate ACK, fast retransmit
-                print(f"DEBUG: 🔄 DUPLICATE ACK {ack_num}, fast retransmit")
-                next_seq = ack_num + 1
-                _send_data_segment_for_session(session_key, sock, seq=next_seq)
-    else:
-        pass
+                # New ACK progresses the window
+                _on_new_ack(session_key, sock, ack_num, now)
+            elif ack_num == session.get("last_acked", 0):
+                # Duplicate ACK
+                _on_duplicate_ack(session_key, sock, ack_num)
+            # else: stale ACK (ack_num < last_acked), ignore
 
 
-def process_user_input(sock: simsocket.SimSocket) -> None:
+def process_user_input(sock: simsocket.SimSocket, line: str) -> None:
     """
     Handles a single line of user input from ``sys.stdin``.
 
@@ -506,13 +625,14 @@ def process_user_input(sock: simsocket.SimSocket) -> None:
     :type sock: simsocket.SimSocket
     """
     try:
-        command, chunk_file, output_file = input().split()
+        parts = line.strip().split()
+        if len(parts) != 3:
+            return
+        command, chunk_file, output_file = parts
     except Exception:
         return
-    if command == "DOWNLOAD":
+    if command.upper() == "DOWNLOAD":
         process_download(sock, chunk_file, output_file)
-    else:
-        pass
 
 
 def peer_run(context: PeerContext) -> None:
@@ -522,41 +642,53 @@ def peer_run(context: PeerContext) -> None:
     addr: AddressType = (context.ip, context.port)
     sock = simsocket.SimSocket(context.identity, addr, verbose=context.verbose)
 
-    last_force_check = 0
+    # 新增：命令队列 + 后台读取线程
+    cmd_queue: Queue[str] = Queue()
+    t = threading.Thread(target=_stdin_reader, args=(cmd_queue,), daemon=True)
+    t.start()
 
     try:
         while True:
-            ready = select.select([sock, sys.stdin], [], [], 0.01)  # 减少到0.01 避免超时
+            # 仅监视 socket，避免在 Windows 上 select sys.stdin
+            ready = select.select([sock], [], [], 0.01)
 
-            read_ready = ready[0]
-            if len(read_ready) > 0:
-                if sock in read_ready:
-                    process_inbound_udp(sock)
-                if sys.stdin in read_ready:
-                    process_user_input(sock)
-            else:
-                now = time.time()
+            if ready[0]:
+                process_inbound_udp(sock)
 
-                # 每2秒强制检查一次
-                # if now - last_force_check > 2.0:
-                #     last_force_check = now
-                #     _force_complete_transfer()
+            # 处理所有已到达的命令行
+            while True:
+                try:
+                    line = cmd_queue.get_nowait()
+                except Empty:
+                    break
+                process_user_input(sock, line)
 
-                # 超时重传检查
-                for session_key, session in list(g_uploads.items()):
-                    last = session.get("last_sent_time", 0)
-                    timeout = rdt_get_timeout(session)
-                    if now - last > timeout:
-                        last_seq = session.get("last_sent_seq", 1)
-                        _send_data_segment_for_session(session_key, sock, seq=last_seq)
+            # 下面保留你已有的定时/超时逻辑（发送端重传、下载会话超时等）
+            now = time.time()
+            for session_key, session in list(g_uploads.items()):
+                timeout = rdt_get_timeout(session)
+                send_base = session.get("send_base", 1)
+                # 使用最早未被 ACK 的分片的发送时间作为超时基准（更符合 RDT）
+                last = session.get("sent_times", {}).get(send_base, session.get("last_sent_time", 0))
+                if now - last > timeout:
+                    # Tahoe-style reaction on timeout
+                    cwnd = session.get("cwnd", 1)
+                    ssthresh = max(int(cwnd / 2), 2)
+                    session["ssthresh"] = ssthresh
+                    session["cwnd"] = 1
+                    session["cc_state"] = "slow_start"
+                    # 可选：重置 dupACKcount
+                    session["dupACKcount"] = 0
+                    print(
+                        f"DEBUG: ⏲️ Timeout: set ssthresh={ssthresh}, cwnd=1, cc_state=slow_start; retransmit seq={send_base}")
+                    seq_to_retransmit = send_base
+                    _send_data_segment_for_session(session_key, sock, seq=seq_to_retransmit)
 
-                # 下载会话超时检查（检测发送端崩溃）
-                # 只在用户未指定超时时间时检查，否则使用用户指定的超时时间
-                if not getattr(g_context, "timeout", 0):
-                    for session_key, session in list(g_downloading.items()):
-                        last_recv = session.get("last_ack_time", session.get("start_time", 0))
-                        if now - last_recv > DOWNLOAD_TIMEOUT:
-                            _handle_download_timeout(session_key, sock)
+            if not getattr(g_context, "timeout", 0):
+                for session_key, session in list(g_downloading.items()):
+                    last_recv = session.get("last_ack_time", session.get("start_time", 0))
+                    if now - last_recv > DOWNLOAD_TIMEOUT:
+                        _handle_download_timeout(session_key, sock)
     except KeyboardInterrupt:
         pass
     finally:
@@ -701,67 +833,88 @@ def _handle_download_timeout(session_key: Tuple[Tuple[str, int], str], sock: sim
 
     print(f"DEBUG: No backup peer for chunk {chunk_hex}, re-broadcast WHOHAS")
 
-def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, from_addr: Tuple,
-                       sock: simsocket.SimSocket, seq_num: int):
-    """Helper function to complete a download and write file."""
-    global g_receiving, g_downloading, g_context, g_output_map, g_want_chunks
+# Replace the entire _complete_download(...) function with this improved implementation:
 
-    # 验证数据完整性
-    if total_bytes < CHUNK_DATA_SIZE:
+def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, from_addr: Tuple, sock: simsocket.SimSocket, seq_num: int):
+    global g_receiving, g_downloading, g_context, g_output_map, g_want_chunks, g_candidates
+
+    # Remove session
+    if session_key in g_downloading:
+        session = g_downloading[session_key]
+        total_segs = session.get("total_segs")
+
+        if seq_num != total_segs:
+            print(f"DEBUG: ⚠️ Download incomplete:  received seq {seq_num}, expected {total_segs}")
+            return
+        try:
+            del g_downloading[session_key]
+        except KeyError:
+            pass
+
+    data = g_receiving.get(chunk_hex)
+    if not data or len(data) < CHUNK_DATA_SIZE:
+        print(f"DEBUG: ❌ No data in g_receiving for {chunk_hex}")
         return
 
-    # 清理下载会话
-    if session_key in g_downloading:
-        del g_downloading[session_key]
-
-    # 检查这个 chunk 是否在接收缓冲区中且有数据
-    if chunk_hex in g_receiving and len(g_receiving[chunk_hex]) >= CHUNK_DATA_SIZE:
-        out_file = g_output_map.get(chunk_hex)
-        if not out_file:
+    if len(data) != CHUNK_DATA_SIZE:
+        print(f"DEBUG: ⚠️ Data size mismatch:  got {len(data)}, expected {CHUNK_DATA_SIZE}")
+        # 如果数据不够,不写入文件
+        if len(data) < CHUNK_DATA_SIZE:
             return
 
-        # 确保目录存在
-        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    out_file = g_output_map.get(chunk_hex)
+    if not out_file:
+        print(f"DEBUG: ❌ No output file mapped for {chunk_hex}")
+        return
 
-        try:
-            download_data = {}
-            completed_chunks = []
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
 
-            for ch in list(g_receiving.keys()):
-                if ch in g_receiving and len(g_receiving[ch]) >= CHUNK_DATA_SIZE:
-                    download_data[ch] = g_receiving[ch]
-                    completed_chunks.append(ch)
+    try:
+        # ⭐ 改进文件写入逻辑
+        # 首先验证数据的SHA1哈希
+        sha1 = hashlib.sha1()
+        sha1.update(data)
+        computed_hash = sha1.hexdigest()
 
-            # 写入文件
-            with open(out_file, "wb") as wf:
-                pickle.dump(download_data, wf)
-
-            for ch in completed_chunks:
-                g_context.has_chunks[ch] = g_receiving[ch]
-                if ch in g_want_chunks:
-                    g_want_chunks.remove(ch)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+        if computed_hash != chunk_hex:
+            print(f"❌ Hash mismatch!  Expected {chunk_hex}, got {computed_hash}")
             return
 
-    if not g_want_chunks and not g_downloading:
-        # 最终验证输出文件
-        output_files = set(g_output_map.values())
-        for out_file in output_files:
-            if os.path.exists(out_file):
-                file_size = os.path.getsize(out_file)
-                try:
-                    with open(out_file, "rb") as f:
-                        content = pickle.load(f)
-                    # 验证哈希
-                    for ch, data in content.items():
-                        sha1 = hashlib.sha1()
-                        sha1.update(data)
-                        actual_hash = sha1.hexdigest()
-                except Exception as e:
-                    print(f"DEBUG: Error reading output file: {e}")
+        # ⭐ 使用pickle格式写入,保持与测试一致
+        existing_data = {}
+        if os.path.exists(out_file):
+            try:
+                with open(out_file, "rb") as f:
+                    existing_data = pickle.load(f)
+            except:
+                existing_data = {}
+
+        existing_data[chunk_hex] = data
+
+        with open(out_file, "wb") as f:
+            pickle.dump(existing_data, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        print(f"✅ Chunk {chunk_hex} verified and written to {out_file} (size: {len(data)} bytes)")
+
+        # 标记为本地可用
+        g_context.has_chunks[chunk_hex] = data
+        if chunk_hex in g_want_chunks:
+            g_want_chunks.remove(chunk_hex)
+
+        # 从候选列表中移除发送者
+        if chunk_hex in g_candidates:
+            g_candidates[chunk_hex] = [c for c in g_candidates[chunk_hex] if c != from_addr]
+
+    except Exception as e:
+        print(f"❌ Write failed: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 def main() -> None:
     """
