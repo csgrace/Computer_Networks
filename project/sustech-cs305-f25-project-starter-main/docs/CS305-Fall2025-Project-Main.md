@@ -181,7 +181,7 @@ Please refer to the next section for more details.
 
 ## Submission and Presentation
 
-Code Submission: **23:59 at Dec. 19th, 2025 (Fri. in Week 15)**
+**Code Submission:** Dec. 19, 2025 (Friday, Week 15) at 23:59
 
 - As we mentioned before, we will release the test scripts in 2 parts. You will receive points for passing these test scripts. Finally, you will need to submit your code to Blackboard.
 - You only need to submit all the code in the `src/` directory. Compress your `src` folder into `gxx_src.zip` (`xx` is your group ID, e.g. `g03_src.zip`). We will grade your project based on this code.

@@ -2,6 +2,7 @@ import sys
 import os
 import pickle
 
+
 class PeerContext:
     """
     Manages the peer's runtime configuration, state, and known peer list.

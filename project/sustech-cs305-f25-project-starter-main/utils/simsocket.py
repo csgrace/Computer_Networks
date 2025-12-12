@@ -5,8 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from typing import Tuple
-AddressType = Tuple[str, int]
+type AddressType = tuple[str, int]
 
 
 class SimSocket:

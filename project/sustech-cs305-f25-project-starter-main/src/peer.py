@@ -32,6 +32,24 @@ The given function is only one possible design, you are not required to follow i
 We allow you to use better code design that conforms to best practices.
 But ensure that your program's entry point is `peer.py` .
 """
+# python3 -m utils.make_data ./example/ex_file.tar ./example/data1.fragment 4 1,2
+# python3 -m utils.make_data ./example/ex_file.tar ./example/data2.fragment 4 3,4
+# sed -n '3p' master.chunkhash > example/download.chunkhash
+# perl utils/hupsim.pl -m example/ex_topo.map -n example/ex_nodes_map -p 50305 -v 2
+
+# export SIMULATOR="127.0.0.1:50305"
+# python3 -m example.demo_sender -p example/ex_nodes_map -c example/data2.fragment -m 1 -i 2 -v 3
+
+# export SIMULATOR="127.0.0.1:50305"
+# python3 -m example.demo_receiver -p example/ex_nodes_map -c example/data1.fragment -m 1 -i 1 -v 3
+# DOWNLOAD example/download.chunkhash example/test.fragment
+
+# pytest test/test_01_basic_handshaking.py
+# pytest test/test_02_basic_transfer.py
+# pytest test/test_03_basic_concurrency.py
+# pytest test/test_04_basic_crash.py
+# pytest test/test_05_adv_1.py
+# pytest test/test_06_adv_2.py
 
 BUF_SIZE: int = 1400
 CHUNK_DATA_SIZE: int = 512 * 1024
