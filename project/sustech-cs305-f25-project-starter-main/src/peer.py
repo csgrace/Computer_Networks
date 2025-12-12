@@ -292,10 +292,10 @@ def _send_data_segment_for_session(session_key: Tuple[str, Tuple[str, int]], soc
     if "timeoutInterval" not in session or not session["timeoutInterval"]:
         session["timeoutInterval"] = session.get("timeout", 0.5)
 
+
 def _send_within_cwnd(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket) -> None:
     """
     Send new segments while inflight < cwnd.
-    inflight = next_seq_num - send_base
     """
     session = g_uploads.get(session_key)
     if not session:
@@ -306,62 +306,67 @@ def _send_within_cwnd(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.
     next_seq_num = session["next_seq_num"]
     cwnd = session.get("cwnd", 1)
 
-    while (next_seq_num - send_base) < min(cwnd, WINDOW_SIZE) and next_seq_num <= total_segs:
+    # ⭐ cwnd 现在是浮点数，取整后使用
+    effective_cwnd = int(cwnd)  # ✅ 显式转换为整数
+    max_inflight = min(effective_cwnd, WINDOW_SIZE)
+
+    while (next_seq_num - send_base) < max_inflight and next_seq_num <= total_segs:
         _send_data_segment_for_session(session_key, sock, seq=next_seq_num)
         session["next_seq_num"] = next_seq_num + 1
         next_seq_num += 1
 
+
 def _on_new_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket, ack_num: int, now: float) -> None:
-    """
-    Handle new ACK that advances last_acked. Apply cc rules and send within cwnd.
-    """
+    """⭐ 处理新ACK（Tahoe拥塞控制核心）"""
     global g_active_uploads
+
     session = g_uploads.get(session_key)
     if not session:
         return
 
     total_segs = session["total_segs"]
     last_acked = session.get("last_acked", 0)
-    send_base = session.get("send_base", 1)
 
-    # RTT sample: from sent_times[ack_num]
+    # RTT采样
     sent_times = session.get("sent_times", {})
     if ack_num in sent_times:
-        sampleRTT = max(0.0, now - sent_times[ack_num])
-        rdt_update_rtt(session, sampleRTT)
+        sample_rtt = max(0.0, now - sent_times[ack_num])  # 🔧 修复：完整表达式
+        rdt_update_rtt(session, sample_rtt)
 
-    # Advance acked window
+    # 更新ACK窗口
     session["last_acked"] = ack_num
     session["send_base"] = ack_num + 1
 
-    # Congestion control transitions + growth
+    # ⭐ 关键：新ACK时重置dupACKcount
+    session["dupACKcount"] = 0
+    session["fast_retransmitted"].discard(ack_num + 1)
+
     cc_state = session.get("cc_state", "slow_start")
     cwnd = session.get("cwnd", 1)
     ssthresh = session.get("ssthresh", 64)
 
-    # This ACK advances the round; per spec we can reset dupACKcount for new round,
-    # BUT do not reset when fast retransmit just happened (spec says not reset after FR);
-    # We interpret "per-round" as reset when progress occurs.
-    session["dupACKcount"] = 0
-    session["fast_retransmitted"]. discard(ack_num + 1)  # optional cleanup
-
+    # ⭐ Tahoe拥塞控制：状态转换和增长
     if cc_state == "slow_start":
-        # cwnd += 1 per new ACK
+        # 慢启动：每个新ACK，cwnd += 1（指数增长）
         cwnd += 1
         session["cwnd"] = cwnd
-        # Transition if cwnd >= ssthresh
+        print(f"DEBUG: 📈 Slow Start: cwnd={cwnd}, ssthresh={ssthresh}")
+
+        # 检查是否转换到拥塞避免
         if cwnd >= ssthresh:
             session["cc_state"] = "congestion_avoidance"
-            print(f"DEBUG: CC transition to congestion_avoidance, cwnd={cwnd}, ssthresh={ssthresh}")
+            print(f"DEBUG: ⚡ Transition to Congestion Avoidance (cwnd={cwnd} >= ssthresh={ssthresh})")
     else:
-        # Congestion Avoidance: cwnd += floor(1/cwnd) per new ACK
-        inc = max(1, int(1 / max(cwnd, 1)))
-        cwnd += inc
-        session["cwnd"] = max(cwnd, 1)
+        # 拥塞避免：每个新ACK，cwnd += 1/cwnd（线性增长）
+        # 累积增长方式
+        increment = 1.0 / max(cwnd, 1)
+        cwnd += increment
+        session["cwnd"] = cwnd
+        print(f"DEBUG: 📈 Congestion Avoidance: cwnd={cwnd:.2f}")
 
-    # Completion check
+    # 完成检查
     if ack_num >= total_segs:
-        print(f"DEBUG: 🎉 All data segments ACKed for {session_key[0]}, upload completed! cwnd={session['cwnd']}")
+        print(f"DEBUG: ✅ Upload complete for {session_key[0]}")
         try:
             del g_uploads[session_key]
             g_active_uploads = max(0, g_active_uploads - 1)
@@ -369,7 +374,7 @@ def _on_new_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSoc
             pass
         return
 
-    # Transmit new packets allowed by increased cwnd
+    # 新窗口允许的包
     _send_within_cwnd(session_key, sock)
 
 def _on_duplicate_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.SimSocket, ack_num: int) -> None:
@@ -382,26 +387,27 @@ def _on_duplicate_ack(session_key: Tuple[str, Tuple[str, int]], sock: simsocket.
 
     dup = session.get("dupACKcount", 0) + 1
     session["dupACKcount"] = dup
-    print(f"DEBUG: DUP ACK {ack_num}, dupACKcount={dup}")
+    print(f"DEBUG: 🔁 Duplicate ACK {ack_num}, dupACKcount={dup}")
 
-    # Fast retransmit once when dupACKcount==3
+    # 快速重传：仅在dupACKcount==3时触发，且只触发一次
     next_seq = ack_num + 1
     if dup == 3 and next_seq not in session["fast_retransmitted"]:
         session["fast_retransmitted"].add(next_seq)
-        print(f"DEBUG: 🚀 Fast retransmit seq={next_seq} (Tahoe), set ssthresh=max(floor(cwnd/2),2), cwnd=1")
+        print(f"DEBUG: 🚀 Fast Retransmit seq={next_seq}")
 
-        # Tahoe-style reaction
+        # ⭐ Tahoe反应：ssthresh=max(cwnd/2, 2), cwnd=1，进入慢启动
         cwnd = session.get("cwnd", 1)
         ssthresh = max(int(cwnd / 2), 2)
         session["ssthresh"] = ssthresh
         session["cwnd"] = 1
         session["cc_state"] = "slow_start"
+        # ⚠️ 重点：不重置dupACKcount（防止重复重传）
 
-        # Retransmit the presumed lost packet
+        # 重传
         _send_data_segment_for_session(session_key, sock, seq=next_seq)
         session["send_base"] = ack_num + 1
         session["next_seq_num"] = max(session.get("next_seq_num", ack_num + 1), ack_num + 2)
-        # Do NOT reset dupACKcount after fast retransmit (per spec)
+        print(f"DEBUG:  Tahoe reaction: ssthresh={ssthresh}, cwnd=1")
 
 def _stdin_reader(cmd_queue):
     """Blockingly read lines from stdin and put them into the queue."""
@@ -479,21 +485,34 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             hhex = _bytes_to_hex(hbytes)
             peer_has_chunks.append(hhex)
 
+        addr = (from_addr[0], from_addr[1])
+
         for hhex in peer_has_chunks:
             if hhex in g_want_chunks:
                 addr = (from_addr[0], from_addr[1])
+
+                if any(sess.get("chunk") == hhex for sess in g_downloading.values()):
+                    # 可将该 addr 记录为候选（g_candidates）以备后续重试
+                    if hhex not in g_candidates:
+                        g_candidates[hhex] = []
+                    if addr not in g_candidates[hhex]:
+                        g_candidates[hhex].append(addr)
+                    continue
 
                 download_key = (addr, hhex)
                 if download_key in g_downloading:
                     continue
 
                 # 检查总并发下载数限制
-                if len(g_downloading) >= 20:
+                if len(g_downloading) >= MAX_TOTAL_CONCURRENT_DOWNLOADS:
+                    g_candidates.setdefault(hhex, [])
+                    if addr not in g_candidates[hhex]:
+                        g_candidates[hhex].append(addr)
                     continue
 
                 # 发送 GET 请求并创建下载会话
-                pkt_get = _pack_header(PktType.GET, HEADER_LEN + len(_hex_to_bytes(hhex)), seq=0,
-                                       ack=0) + _hex_to_bytes(hhex)
+                payload = _hex_to_bytes(hhex)
+                pkt_get = _pack_header(PktType.GET, HEADER_LEN + len(payload), seq=0, ack=0) + payload
                 sock.sendto(pkt_get, from_addr)
 
                 g_downloading[download_key] = {
@@ -508,10 +527,10 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 if hhex not in g_receiving:
                     g_receiving[hhex] = b""
 
-                if hhex not in g_candidates:
-                    g_candidates[hhex] = []
+                g_candidates.setdefault(hhex, [])
                 if addr not in g_candidates[hhex]:
                     g_candidates[hhex].append(addr)
+
     # DENIED: ignore for now
     elif pkg_type == PktType.DENIED:
         pass
