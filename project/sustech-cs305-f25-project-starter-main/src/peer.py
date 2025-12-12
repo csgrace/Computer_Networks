@@ -103,6 +103,8 @@ g_output_map: Dict[str, str] = {}
 #重发WHOHAS次数
 g_whohas_retry_count: int = 0
 
+g_out_of_order_buffer: Dict[Tuple[Tuple[str, int], str], Dict[int, bytes]] = {}  # 乱序包缓存
+
 #最大重试次数
 MAX_WHOHAS_RETRIES: int = 3
 
@@ -427,7 +429,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     :param sock: The :class:`simsocket.SimSocket` with a pending packet.
     :type sock: simsocket.SimSocket
     """
-    global g_context, g_active_uploads, g_candidates, g_receiving, g_want_chunks, g_uploads, g_downloading, g_active_uploads
+    global g_context, g_active_uploads, g_candidates, g_receiving, g_want_chunks, g_uploads, g_downloading, g_out_of_order_buffer
 
     pkt, from_addr = sock.recvfrom(BUF_SIZE)
     try:
@@ -562,6 +564,9 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         if chunk_hex not in g_receiving:
             g_receiving[chunk_hex] = b""
 
+        if session_key not in g_out_of_order_buffer:
+            g_out_of_order_buffer[session_key] = {}
+
         if seq_num == expected:
             # 正确的序列号,追加数据
             g_receiving[chunk_hex] += payload
@@ -574,16 +579,46 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             # 更新期望序列号
             session["expected_seq"] = expected + 1
 
-            # ⭐ 检查是否是最后一个分片
-            if seq_num == session["total_segs"]:
-                print(f"DEBUG: 📦 Received last segment {seq_num}/{session['total_segs']} for {chunk_hex}")
-                _complete_download(chunk_hex, len(g_receiving[chunk_hex]), session_key, from_addr, sock, seq_num)
-        else:
-            # 乱序或重复,发送累积ACK
-            ack_to_send = max(0, expected - 1)
+            # ⭐ 检查缓冲区中是否有后续的连续包
+            buffer = g_out_of_order_buffer[session_key]
+            while (expected + 1) in buffer:
+                next_seq = expected + 1
+                next_payload = buffer.pop(next_seq)
+
+                g_receiving[chunk_hex] += next_payload
+                session["expected_seq"] = next_seq + 1
+                session["last_ack_time"] = time.time()
+
+                # 发送ACK
+                ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=next_seq)
+                sock.sendto(ack_pkt, from_addr)
+
+                expected = next_seq
+                print(f"DEBUG: ✨ Delivered buffered packet seq={next_seq}, new expected={expected + 1}")
+
+            # 检查是否完成
+            current_expected = session["expected_seq"]
+            if (current_expected - 1) == session["total_segs"]:
+                print(f"DEBUG: 📦 All segments received for {chunk_hex}")
+                _complete_download(chunk_hex, len(g_receiving[chunk_hex]), session_key, from_addr, sock,
+                                   current_expected - 1)
+
+        elif seq_num > expected:
+            # ⭐ 乱序包: 缓存起来
+            buffer = g_out_of_order_buffer[session_key]
+            if seq_num not in buffer:  # 避免重复缓存
+                buffer[seq_num] = payload
+                print(
+                    f"DEBUG: 📦 Buffered out-of-order packet seq={seq_num}, expected={expected}, buffer_size={len(buffer)}")
+
+            # 发送累积ACK (期望序列号的前一个)
+            ack_to_send = expected - 1
             ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
             sock.sendto(ack_pkt, from_addr)
-            print(f"DEBUG: Out-of-order DATA:  got seq={seq_num}, expected={expected}, sent ACK={ack_to_send}")
+        else:
+            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
+            sock.sendto(ack_pkt, from_addr)
+            print(f"DEBUG: 🔁 Duplicate packet seq={seq_num}, expected={expected}")
 
     # ACK: sender side (RDT + Tahoe CC)
 
@@ -835,30 +870,38 @@ def _handle_download_timeout(session_key: Tuple[Tuple[str, int], str], sock: sim
 
 # Replace the entire _complete_download(...) function with this improved implementation:
 
-def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, from_addr: Tuple, sock: simsocket.SimSocket, seq_num: int):
-    global g_receiving, g_downloading, g_context, g_output_map, g_want_chunks, g_candidates
+def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, from_addr: Tuple,
+                       sock: simsocket.SimSocket, seq_num: int):
+    """完成下载的改进版本"""
+    global g_receiving, g_downloading, g_context, g_output_map, g_want_chunks, g_candidates, g_out_of_order_buffer
 
-    # Remove session
+    # 清理乱序缓冲区
+    if session_key in g_out_of_order_buffer:
+        del g_out_of_order_buffer[session_key]
+
+    # 从下载会话中移除
     if session_key in g_downloading:
         session = g_downloading[session_key]
         total_segs = session.get("total_segs")
 
+        # 检查是否真的完成了
         if seq_num != total_segs:
-            print(f"DEBUG: ⚠️ Download incomplete:  received seq {seq_num}, expected {total_segs}")
+            print(f"DEBUG: ⚠️ Download incomplete: received seq {seq_num}, expected {total_segs}")
             return
+
         try:
             del g_downloading[session_key]
         except KeyError:
             pass
 
     data = g_receiving.get(chunk_hex)
-    if not data or len(data) < CHUNK_DATA_SIZE:
+    if not data:
         print(f"DEBUG: ❌ No data in g_receiving for {chunk_hex}")
         return
 
+    # 检查数据大小
     if len(data) != CHUNK_DATA_SIZE:
         print(f"DEBUG: ⚠️ Data size mismatch:  got {len(data)}, expected {CHUNK_DATA_SIZE}")
-        # 如果数据不够,不写入文件
         if len(data) < CHUNK_DATA_SIZE:
             return
 
@@ -870,8 +913,7 @@ def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, fro
     os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
 
     try:
-        # ⭐ 改进文件写入逻辑
-        # 首先验证数据的SHA1哈希
+        # 验证数据的SHA1哈希
         sha1 = hashlib.sha1()
         sha1.update(data)
         computed_hash = sha1.hexdigest()
@@ -880,7 +922,7 @@ def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, fro
             print(f"❌ Hash mismatch!  Expected {chunk_hex}, got {computed_hash}")
             return
 
-        # ⭐ 使用pickle格式写入,保持与测试一致
+        # 使用pickle格式写入
         existing_data = {}
         if os.path.exists(out_file):
             try:
@@ -901,17 +943,15 @@ def _complete_download(chunk_hex: str, total_bytes: int, session_key: Tuple, fro
 
         print(f"✅ Chunk {chunk_hex} verified and written to {out_file} (size: {len(data)} bytes)")
 
-        # 标记为本地可用
         g_context.has_chunks[chunk_hex] = data
         if chunk_hex in g_want_chunks:
             g_want_chunks.remove(chunk_hex)
 
-        # 从候选列表中移除发送者
         if chunk_hex in g_candidates:
             g_candidates[chunk_hex] = [c for c in g_candidates[chunk_hex] if c != from_addr]
 
     except Exception as e:
-        print(f"❌ Write failed: {e}")
+        print(f"❌ Write failed:  {e}")
         import traceback
         traceback.print_exc()
 
