@@ -8,9 +8,10 @@ _DATE_FMT: str = "%m-%d %H:%M:%S.%f"
 _PATTERN: str = r"\('127.0.0.1', (\d*)\)"
 _SPILITTER: str = "|-"
 
-type TimeList = list[float]
-type CountList = list[int]
-type SessionData = list[TimeList | CountList]
+from typing import List
+TimeList = List[float]
+CountList = List[int]
+SessionData = List[TimeList | CountList]
 
 
 def str2time(t_str: str) -> float:

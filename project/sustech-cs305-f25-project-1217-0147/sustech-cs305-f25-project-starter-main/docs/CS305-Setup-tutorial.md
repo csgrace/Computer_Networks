@@ -55,7 +55,7 @@ The four main directories serve the following purposes:
 Below is a description of the most important files in the project code framework:
 
 - **`src/peer.py`**: The main file for your implementation. You are expected to complete this file to meet the project requirements.
-  - **Note**: You must use the provided `simsocket` for all network operations; normal `socket.socket` object are not permitted. We allow you to use better code design that conforms to best practices.  Ensure that your program's entry point is `peer.py`, which can parse the given command-line arguments.
+  - **Note**: You must use the provided `simsocket` for all network operations; normal sockets are not permitted. We allow you to use better code design that conforms to best practices.  Ensure that your program's entry point is `peer.py`, which can parse the given command-line arguments.
 
 - **`utils/simsocket.py`**: Provides the `SimSocket` class, a modified socket that can run with or without the network simulator. **Do not modify this file**.
 - **`utils/hupsim.pl`**: A network simulator written in Perl that can emulate routing, queuing, congestion, and packet loss.
@@ -294,21 +294,6 @@ pytest test/test_01_basic_handshaking.py
 ```
 
 You can build your own test cases and scripts in the test folder and run them with the relevant commands.
-
-## Congestion Control Example
-
-You are required to plot a graph to show your congestion control process. The graph should clearly demonstrate the correct state transitions of your algorithm:
-
-- **Slow Start:** Initial exponential growth of the window size.
-- **Congestion Avoidance:** Linear growth after the window reaches the threshold (`ssthresh`).
-- **Packet Loss Handling:** When a timeout or loss occurs, the window size must drop to 1, and the `ssthresh` must be updated for the next cycle.
-- **Re-entering Slow Start**: Your second slow start will have a lower threshold for turning to congestion avoidance.
-
-Below is a simple example for all these phases. Note that this ideal example curve **only shows a trend** and may not same as the actual working conditions and configuration values.
-
-You can add other necessary information to the graph, but at least your curve should reflect these congestion control phases.
-
-<img src="./img/cc-example.png" alt="cc-example" style="zoom:40%;" />
 
 ## Linux Setup
 

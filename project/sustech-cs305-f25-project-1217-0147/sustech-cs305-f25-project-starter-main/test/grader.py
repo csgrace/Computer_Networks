@@ -75,7 +75,7 @@ class PeerProc:
         self.process = subprocess.Popen(
             cmd_args,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            # stdout=subprocess.DEVNULL,  # n3
             text=True,
             bufsize=1,
         )
