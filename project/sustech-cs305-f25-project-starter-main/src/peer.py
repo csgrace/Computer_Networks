@@ -153,9 +153,12 @@ class PeerState:
         # event_type: 'slow_start', 'congestion_avoidance', 'timeout', 'fast_retransmit', 'init'
         self.cwnd_history: Dict[Tuple[str, Tuple[str, int]], List[Tuple[float, float, str, int]]] = {}
 
+        self.next_whohas_retry_time: Optional[float] = None
+
     def reset_download_state(self):
         """Reset download-related state for a new download."""
         self.whohas_retry_count = 0
+        self.next_whohas_retry_time = None  # 重置调度时间
         self.want_chunks = []
         self.candidates = {}
         self.receiving = {}
@@ -174,8 +177,8 @@ class Peer:
         self.context = context
         self.state = PeerState(context)
         self.sock: Optional[simsocket.SimSocket] = None
-        self.cmd_queue: Queue[str] = Queue()
-        self.stdin_thread: Optional[threading.Thread] = None
+        # self.cmd_queue: Queue[str] = Queue()
+        # self.stdin_thread: Optional[threading.Thread] = None
 
     def _log_prefix(self) -> str:
         """Generate log prefix with peer identity and address."""
@@ -198,31 +201,37 @@ class Peer:
         self.sock = simsocket.SimSocket(self.context.identity, addr, verbose=self.context.verbose)
 
         # Start stdin reader thread
-        self.stdin_thread = threading.Thread(target=self._stdin_reader, daemon=True)
-        self.stdin_thread.start()
+        # self.stdin_thread = threading.Thread(target=self._stdin_reader, daemon=True)
+        # self.stdin_thread.start()
 
         try:
             while True:
-                ready = select.select([self.sock], [], [], 0.01)
+                # 监听 socket 和 stdin（Unix 系统支持）
+                rlist = [self.sock]
+                try:
+                    # 尝试将 stdin 加入监听（Windows 不支持，会抛异常）
+                    rlist.append(sys.stdin)
+                except:
+                    pass
 
-                if ready[0]:
+                ready, _, _ = select.select(rlist, [], [], 0.01)
+
+                # 处理网络数据包
+                if self.sock in ready:
                     self._process_inbound_udp()
 
-                # Process all queued commands
-                while True:
-                    try:
-                        line = self.cmd_queue.get_nowait()
-                    except Empty:
-                        break
-                    self._process_user_input(line)
+                # 处理 stdin 输入（非阻塞）
+                if sys.stdin in ready:
+                    line = sys.stdin.readline()
+                    if line:
+                        self._process_user_input(line)
 
-                # Handle timeouts
+                # 处理超时和定时任务
                 self._check_timeouts()
 
         except KeyboardInterrupt:
             pass
         finally:
-            # Generate cwnd plot before closing
             self._plot_cwnd()
             if self.sock:
                 self.sock.close()
@@ -231,17 +240,6 @@ class Peer:
     # Step 4: Simple Modules (CommandReader, etc.)
     # ========================================================================
 
-    def _stdin_reader(self):
-        """Read lines from stdin and put them into the queue."""
-        try:
-            while True:
-                line = sys.stdin.readline()
-                if line == "":
-                    time.sleep(0.01)
-                    continue
-                self.cmd_queue.put(line)
-        except Exception:
-            pass
 
     def _process_user_input(self, line: str):
         """Process a single line of user input."""
@@ -301,11 +299,10 @@ class Peer:
                 continue
 
         # Schedule retry
-        threading.Timer(3.0, self._retry_whohas).start()
+        self.state.next_whohas_retry_time = time.time() + 3.0
 
     def _retry_whohas(self):
         """Retry sending WHOHAS packets."""
-        time.sleep(3)
 
         if (not self.state.downloading and
                 self.state.want_chunks and
@@ -326,8 +323,16 @@ class Peer:
                 except Exception:
                     continue
 
+            # 如果还需要继续重试，设置下次重试时间
             if self.state.whohas_retry_count < MAX_WHOHAS_RETRIES:
-                threading.Timer(3.0, self._retry_whohas).start()
+                self.state.next_whohas_retry_time = time.time() + 3.0
+            else:
+                self.state.next_whohas_retry_time = None
+
+        else:
+            # 不需要重试，清空调度时间
+            self.state.next_whohas_retry_time = None
+
 
     def _process_inbound_udp(self):
         """Process a single inbound UDP packet."""
@@ -604,10 +609,17 @@ class Peer:
             # Update last_ack_time even for out-of-order packets (indicates peer is still alive)
             session.last_ack_time = time.time()
 
-            # Send cumulative ACK
-            ack_to_send = expected - 1
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
-            self.sock.sendto(ack_pkt, from_addr)
+
+            # Send cumulative ACK (但不能发送 ACK=0，因为 seq 从 1 开始)
+            if expected > 1:
+                ack_to_send = expected - 1
+                ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
+                self.sock.sendto(ack_pkt, from_addr)
+                self._log(f"DEBUG:  Sent cumulative ACK={ack_to_send} for out-of-order seq={seq_num}")
+            else:
+                # 如果 expected=1（还没收到任何数据），不发送 ACK（或者可以选择不发送）
+                # 因为没有可以确认的数据
+                self._log(f"DEBUG:  Ignoring out-of-order seq={seq_num}, expected={expected}, no data received yet")
         else:
             ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
             self.sock.sendto(ack_pkt, from_addr)
@@ -639,6 +651,12 @@ class Peer:
     def _check_timeouts(self):
         """Check for timeout conditions."""
         now = time.time()
+
+        # 新增：检查 WHOHAS 重试调度
+        if (self.state.next_whohas_retry_time is not None and
+                now >= self.state.next_whohas_retry_time):
+            self.state.next_whohas_retry_time = None  # 先清空，避免重复触发
+            self._retry_whohas()
 
         # Check upload timeouts
         for session_key, session in list(self.state.uploads.items()):
@@ -1280,7 +1298,7 @@ class Peer:
 
                 # Reset retry count since we're starting a new search, and schedule retry if needed
                 self.state.whohas_retry_count = 0
-                threading.Timer(3.0, self._retry_whohas).start()
+                self.state.next_whohas_retry_time = time.time() + 3.0
             except Exception as e:
                 self._log(f"DEBUG: Failed to send WHOHAS: {e}")
 
