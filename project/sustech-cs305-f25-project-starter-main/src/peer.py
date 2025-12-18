@@ -16,6 +16,9 @@ from queue import Queue, Empty
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import IntEnum
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 # Ensure project root in sys.path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +46,8 @@ HEADER_LEN: int = struct.calcsize(HEADER_FMT)
 
 MAX_WHOHAS_RETRIES: int = 3
 WINDOW_SIZE = 32
-DOWNLOAD_TIMEOUT: float = 10.0
+DOWNLOAD_TIMEOUT_WITH_DATA: float = 3.0
+DOWNLOAD_TIMEOUT_WITHOUT_DATA: float = 1.0
 
 # RTT params
 ALPHA = 0.15
@@ -143,6 +147,11 @@ class PeerState:
 
         # Out-of-order packet buffer
         self.out_of_order_buffer: Dict[Tuple[Tuple[str, int], str], Dict[int, bytes]] = {}
+        
+        # Cwnd recording for congestion control visualization
+        # Format: {session_key: [(timestamp, cwnd_value, event_type, ssthresh), ...]}
+        # event_type: 'slow_start', 'congestion_avoidance', 'timeout', 'fast_retransmit', 'init'
+        self.cwnd_history: Dict[Tuple[str, Tuple[str, int]], List[Tuple[float, float, str, int]]] = {}
 
     def reset_download_state(self):
         """Reset download-related state for a new download."""
@@ -177,6 +186,12 @@ class Peer:
         # if self.context.identity in [1,5]: # filter
         print(f"{self._log_prefix()} {message}")
 
+    def _record_cwnd(self, session_key: Tuple[str, Tuple[str, int]], cwnd: float, event_type: str, ssthresh: int):
+        """Record cwnd change for visualization."""
+        if session_key not in self.state.cwnd_history:
+            self.state.cwnd_history[session_key] = []
+        self.state.cwnd_history[session_key].append((time.time(), cwnd, event_type, ssthresh))
+
     def run(self):
         """Main event loop."""
         addr: AddressType = (self.context.ip, self.context.port)
@@ -207,6 +222,8 @@ class Peer:
         except KeyboardInterrupt:
             pass
         finally:
+            # Generate cwnd plot before closing
+            self._plot_cwnd()
             if self.sock:
                 self.sock.close()
 
@@ -473,10 +490,10 @@ class Peer:
                 is_slow = False
                 if existing_session.total_segs is not None:
                     progress_ratio = existing_session.send_base / existing_session.total_segs
-                    if progress_ratio < 0.1 and time_since_last_ack > 20.0:
+                    if progress_ratio < 0.1 and time_since_last_ack > DOWNLOAD_TIMEOUT_WITHOUT_DATA:
                         # 刚开始但很长时间没有ACK
                         is_slow = True
-                    elif progress_ratio > 0.1 and time_since_last_ack > 30.0:
+                    elif progress_ratio > 0.1 and time_since_last_ack > DOWNLOAD_TIMEOUT_WITH_DATA:
                         # 有一定进度但长时间没有ACK
                         is_slow = True
 
@@ -638,6 +655,7 @@ class Peer:
                     session.cwnd = 1.0
                     session.cc_state = "slow_start"
                     session.dupACKcount = 0
+                    self._record_cwnd(session_key, session.cwnd, 'timeout', session.ssthresh)
                     self._log(f"DEBUG: ⏲️ Timeout: retransmit seq={send_base}")
                     self._send_data_segment_for_session(session_key, send_base)
 
@@ -656,6 +674,7 @@ class Peer:
                     session.cwnd = 1.0
                     session.cc_state = "slow_start"
                     session.dupACKcount = 0
+                    self._record_cwnd(session_key, session.cwnd, 'timeout', session.ssthresh)
                     self._log(
                         f"DEBUG: ⏲️ Timeout: set ssthresh={ssthresh}, cwnd=1, cc_state=slow_start; retransmit seq={send_base}")
                     seq_to_retransmit = send_base
@@ -671,10 +690,10 @@ class Peer:
 
             # 没有收到任何数据 使用较短超时
             if expected_seq == 1:
-                if now - last_recv > 15.0:
+                if now - last_recv > DOWNLOAD_TIMEOUT_WITHOUT_DATA:
                     self._handle_download_timeout(session_key)
             else:
-                if now - last_recv > 30.0:
+                if now - last_recv > DOWNLOAD_TIMEOUT_WITH_DATA:
                     self._log(f"DEBUG: Download progress: expected_seq={expected_seq}, total_segs={total_segs}")
                     self._handle_download_timeout(session_key)
                 else:
@@ -716,6 +735,9 @@ class Peer:
         key = (chunk_hex, addr)
         self.state.uploads[key] = session
         self.state.active_uploads += 1
+
+        # Record initial cwnd
+        self._record_cwnd(key, session.cwnd, 'init', session.ssthresh)
 
         # Send up to cwnd initial segments
         self._send_within_cwnd(key)
@@ -837,6 +859,7 @@ class Peer:
                     session.cwnd = 1.0
                     session.cc_state = "slow_start"
                     session.dupACKcount = 0
+                    self._record_cwnd(session_key, session.cwnd, 'timeout', session.ssthresh)
                     self._send_data_segment_for_session(session_key, new_send_base)
                     # Don't continue with normal ACK processing (cwnd growth) after timeout
                     return
@@ -850,17 +873,20 @@ class Peer:
             # Slow start: each new ACK, cwnd += 1 (exponential growth)
             cwnd += 1
             session.cwnd = cwnd
+            self._record_cwnd(session_key, session.cwnd, 'slow_start', ssthresh)
             self._log(f"DEBUG: Slow Start: cwnd={cwnd}, ssthresh={ssthresh}")
 
             # Check transition to congestion avoidance
             if cwnd >= ssthresh:
                 session.cc_state = "congestion_avoidance"
+                self._record_cwnd(session_key, session.cwnd, 'congestion_avoidance', ssthresh)
                 self._log(f"DEBUG: ⚡ Transition to Congestion Avoidance (cwnd={cwnd} >= ssthresh={ssthresh})")
         else:
             # Congestion avoidance: each new ACK, cwnd += 1/cwnd (linear growth)
             increment = 1.0 / max(cwnd, 1)
             cwnd += increment
             session.cwnd = cwnd
+            self._record_cwnd(session_key, session.cwnd, 'congestion_avoidance', ssthresh)
             self._log(f"DEBUG: Congestion Avoidance: cwnd={cwnd:.2f}")
 
         # Completion check
@@ -899,6 +925,7 @@ class Peer:
             session.ssthresh = ssthresh
             session.cwnd = 1.0
             session.cc_state = "slow_start"
+            self._record_cwnd(session_key, session.cwnd, 'fast_retransmit', session.ssthresh)
             # Note: don't reset dupACKcount (prevent duplicate retransmission)
 
             # Retransmit
@@ -906,6 +933,219 @@ class Peer:
             session.send_base = ack_num + 1
             session.next_seq_num = max(session.next_seq_num, ack_num + 2)
             self._log(f"DEBUG:  Tahoe reaction: ssthresh={ssthresh}, cwnd=1")
+
+    # ========================================================================
+    # Cwnd Visualization
+    # ========================================================================
+
+    def _plot_cwnd(self):
+        """Plot cwnd changes over time for all sessions."""
+        if not self.state.cwnd_history:
+            return
+        
+        # Create output directory if it doesn't exist
+        log_dir = os.path.join(_project_root, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Plot each session separately
+        for session_key, history in self.state.cwnd_history.items():
+            if not history:
+                continue
+            
+            chunk_hex, addr = session_key
+            peer_id = self.context.identity
+            addr_str = f"{addr[0]}:{addr[1]}"
+            
+            # Extract data
+            timestamps = [t[0] for t in history]
+            cwnd_values = [t[1] for t in history]
+            event_types = [t[2] for t in history]
+            ssthresh_values = [t[3] for t in history]
+            
+            # Normalize timestamps to start from 0
+            if timestamps:
+                start_time = timestamps[0]
+                timestamps = [t - start_time for t in timestamps]
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Plot cwnd
+            ax.plot(timestamps, cwnd_values, 'b-', linewidth=2, label='cwnd', marker='o', markersize=4)
+            
+            # Plot ssthresh as horizontal lines
+            unique_ssthresh = []
+            unique_ssthresh_times = []
+            prev_ssthresh = None
+            for i, (t, ssthresh) in enumerate(zip(timestamps, ssthresh_values)):
+                if ssthresh != prev_ssthresh:
+                    unique_ssthresh.append(ssthresh)
+                    unique_ssthresh_times.append(t)
+                    prev_ssthresh = ssthresh
+                elif i == len(timestamps) - 1:
+                    # Draw line to the end
+                    if unique_ssthresh:
+                        ax.hlines(unique_ssthresh[-1], unique_ssthresh_times[-1], t, 
+                                 colors='r', linestyles='--', linewidth=1.5, alpha=0.7)
+            
+            # Draw ssthresh lines
+            for i in range(len(unique_ssthresh) - 1):
+                ax.hlines(unique_ssthresh[i], unique_ssthresh_times[i], unique_ssthresh_times[i+1],
+                         colors='r', linestyles='--', linewidth=1.5, alpha=0.7, label='ssthresh' if i == 0 else '')
+            if unique_ssthresh and len(timestamps) > 0:
+                ax.hlines(unique_ssthresh[-1], unique_ssthresh_times[-1], timestamps[-1],
+                         colors='r', linestyles='--', linewidth=1.5, alpha=0.7, label='ssthresh' if len(unique_ssthresh) == 1 else '')
+            
+            # Annotate events
+            event_colors = {
+                'init': 'green',
+                'slow_start': 'blue',
+                'congestion_avoidance': 'orange',
+                'timeout': 'red',
+                'fast_retransmit': 'purple'
+            }
+            
+            prev_event = None
+            for i, (t, cwnd, event, _) in enumerate(zip(timestamps, cwnd_values, event_types, ssthresh_values)):
+                if event != prev_event and event in event_colors:
+                    ax.scatter(t, cwnd, color=event_colors[event], s=100, zorder=5, 
+                             label=event.replace('_', ' ').title() if event != prev_event else '')
+                    # Add text annotation for major events
+                    if event in ['timeout', 'fast_retransmit', 'congestion_avoidance']:
+                        ax.annotate(event.replace('_', ' ').title(), 
+                                  xy=(t, cwnd), xytext=(5, 5), textcoords='offset points',
+                                  fontsize=8, alpha=0.7)
+                prev_event = event
+            
+            # Set labels and title
+            ax.set_xlabel('Time (seconds)', fontsize=12)
+            ax.set_ylabel('Congestion Window (cwnd)', fontsize=12)
+            ax.set_title(f'Peer{peer_id} - Cwnd vs Time (Chunk: {chunk_hex[:8]}..., Addr: {addr_str})', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper left', fontsize=9)
+            
+            # Save figure
+            safe_addr = addr_str.replace(':', '_')
+            safe_chunk = chunk_hex[:8]
+            filename = f"cwnd_peer{peer_id}_{safe_chunk}_{safe_addr}.png"
+            filepath = os.path.join(log_dir, filename)
+            plt.tight_layout()
+            plt.savefig(filepath, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            self._log(f"DEBUG: Saved cwnd plot to {filepath}")
+
+    # ========================================================================
+    # Cwnd Visualization
+    # ========================================================================
+
+    def _plot_cwnd(self):
+        """Plot cwnd changes over time for all sessions."""
+        if not self.state.cwnd_history:
+            return
+        
+        # Create output directory if it doesn't exist
+        log_dir = os.path.join(_project_root, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Plot each session separately
+        for session_key, history in self.state.cwnd_history.items():
+            if not history:
+                continue
+            
+            chunk_hex, addr = session_key
+            peer_id = self.context.identity
+            addr_str = f"{addr[0]}:{addr[1]}"
+            
+            # Extract data
+            timestamps = [t[0] for t in history]
+            cwnd_values = [t[1] for t in history]
+            event_types = [t[2] for t in history]
+            ssthresh_values = [t[3] for t in history]
+            
+            # Normalize timestamps to start from 0
+            if timestamps:
+                start_time = timestamps[0]
+                timestamps = [t - start_time for t in timestamps]
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Plot cwnd
+            ax.plot(timestamps, cwnd_values, 'b-', linewidth=2, label='cwnd', marker='o', markersize=4)
+            
+            # Plot ssthresh as horizontal lines
+            unique_ssthresh = []
+            unique_ssthresh_times = []
+            prev_ssthresh = None
+            for i, (t, ssthresh) in enumerate(zip(timestamps, ssthresh_values)):
+                if ssthresh != prev_ssthresh:
+                    unique_ssthresh.append(ssthresh)
+                    unique_ssthresh_times.append(t)
+                    prev_ssthresh = ssthresh
+            
+            # Draw ssthresh lines
+            ssthresh_labeled = False
+            for i in range(len(unique_ssthresh)):
+                label = 'ssthresh' if not ssthresh_labeled else ''
+                if i < len(unique_ssthresh) - 1:
+                    ax.hlines(unique_ssthresh[i], unique_ssthresh_times[i], unique_ssthresh_times[i+1],
+                             colors='r', linestyles='--', linewidth=1.5, alpha=0.7, label=label)
+                else:
+                    ax.hlines(unique_ssthresh[i], unique_ssthresh_times[i], timestamps[-1] if timestamps else unique_ssthresh_times[i],
+                             colors='r', linestyles='--', linewidth=1.5, alpha=0.7, label=label)
+                if not ssthresh_labeled:
+                    ssthresh_labeled = True
+            
+            # Annotate events - mark major events (timeout, fast_retransmit)
+            # Track which event types we've already added to legend
+            timeout_labeled = False
+            fast_retransmit_labeled = False
+            
+            for i, (t, cwnd, event, _) in enumerate(zip(timestamps, cwnd_values, event_types, ssthresh_values)):
+                if event == 'timeout':
+                    # Only add label for the first timeout event
+                    label = 'Timeout' if not timeout_labeled else ''
+                    ax.scatter(t, cwnd, color='red', s=150, zorder=5, marker='x', label=label)
+                    if not timeout_labeled:
+                        timeout_labeled = True
+                    ax.annotate('Timeout', xy=(t, cwnd), xytext=(10, 10), textcoords='offset points',
+                              fontsize=9, alpha=0.8, fontweight='bold', color='red')
+                elif event == 'fast_retransmit':
+                    # Only add label for the first fast_retransmit event
+                    label = 'Fast Retransmit' if not fast_retransmit_labeled else ''
+                    ax.scatter(t, cwnd, color='purple', s=150, zorder=5, marker='s', label=label)
+                    if not fast_retransmit_labeled:
+                        fast_retransmit_labeled = True
+                    ax.annotate('Fast Retransmit', xy=(t, cwnd), xytext=(10, 10), textcoords='offset points',
+                              fontsize=9, alpha=0.8, fontweight='bold', color='purple')
+            
+            # Mark congestion avoidance transition
+            prev_event = None
+            for i, (t, cwnd, event, _) in enumerate(zip(timestamps, cwnd_values, event_types, ssthresh_values)):
+                if event == 'congestion_avoidance' and prev_event == 'slow_start':
+                    ax.axvline(x=t, color='green', linestyle='--', alpha=0.6, linewidth=2)
+                    ax.text(t, ax.get_ylim()[1] * 0.98, 'CA Start', rotation=90, 
+                           verticalalignment='top', fontsize=9, alpha=0.8, color='green', fontweight='bold')
+                prev_event = event
+            
+            # Set labels and title
+            ax.set_xlabel('Time (seconds)', fontsize=12)
+            ax.set_ylabel('Congestion Window (cwnd)', fontsize=12)
+            ax.set_title(f'Peer{peer_id} - Cwnd vs Time (Chunk: {chunk_hex[:8]}..., Addr: {addr_str})', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper left', fontsize=9)
+            
+            # Save figure
+            safe_addr = addr_str.replace(':', '_')
+            safe_chunk = chunk_hex[:8]
+            filename = f"cwnd_peer{peer_id}_{safe_chunk}_{safe_addr}.png"
+            filepath = os.path.join(log_dir, filename)
+            plt.tight_layout()
+            plt.savefig(filepath, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            self._log(f"DEBUG: Saved cwnd plot to {filepath}")
 
     # ========================================================================
     # RTT Management
