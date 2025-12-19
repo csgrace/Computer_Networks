@@ -11,8 +11,6 @@ import hashlib
 import argparse
 import pickle
 import time
-import threading
-from queue import Queue, Empty
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -817,7 +815,7 @@ class Peer:
         cwnd = session.cwnd
 
         effective_cwnd = int(cwnd)
-        max_inflight = min(effective_cwnd, WINDOW_SIZE)
+        # max_inflight = min(effective_cwnd, WINDOW_SIZE)
 
         while (next_seq_num - send_base) < max_inflight and next_seq_num <= total_segs:
             self._send_data_segment_for_session(session_key, next_seq_num)
@@ -1555,5 +1553,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-## 000

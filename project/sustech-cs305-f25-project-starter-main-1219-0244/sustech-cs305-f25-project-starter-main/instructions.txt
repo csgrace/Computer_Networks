@@ -1,25 +1,25 @@
 在终端输入： wsl       // pkill -f hupsim.pl
 
-运行通过test1：[14.88s] [17.13s]
+运行通过test1：[14.88s] [17.13s] [16.67s]
 export PYTHONPATH=$(pwd)
 pytest test/test_01_basic_handshaking.py -q
 
 pytest test/test_01_basic_handshaking.py
 
-运行通过test2：[9.42s] [6.07s]
+运行通过test2：[9.42s] [6.07s] [3.03s]
 export PYTHONPATH=$(pwd)
 pytest test/test_02_basic_transfer.py -q
 
 pytest test/test_02_basic_transfer.py
 
-运行通过test3：[25.39s] [14.96s]
+运行通过test3：[25.39s] [14.96s] [14.90s]
 pytest test/test_03_basic_concurrency.py
 
-运行通过test4：[50.61s] [47.32s]
+运行通过test4：[50.61s] [47.32s] [48.89s]
 pytest test/test_04_basic_crash.py
 
-运行通过test5：[39.22s] [39.99s]
+运行通过test5：[39.22s] [39.99s] [38.83s]
 pytest test/test_05_adv_1.py
 
-运行通过test6：[0:08:16] [0:08:07]
+运行通过test6：[0:08:16] [0:08:07] [0:08:13]
 pytest test/test_06_adv_2.py
