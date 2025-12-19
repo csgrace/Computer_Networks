@@ -816,6 +816,7 @@ class Peer:
 
         effective_cwnd = int(cwnd)
         # max_inflight = min(effective_cwnd, WINDOW_SIZE)
+        max_inflight = effective_cwnd
 
         while (next_seq_num - send_base) < max_inflight and next_seq_num <= total_segs:
             self._send_data_segment_for_session(session_key, next_seq_num)
