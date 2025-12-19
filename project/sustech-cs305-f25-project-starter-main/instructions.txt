@@ -1,12 +1,12 @@
 在终端输入： wsl       // pkill -f hupsim.pl
 
-运行通过test1：[14.88s] [17.13s] [17.25s]
+运行通过test1：[14.88s] [17.13s] [16.67s]
 export PYTHONPATH=$(pwd)
 pytest test/test_01_basic_handshaking.py -q
 
 pytest test/test_01_basic_handshaking.py
 
-运行通过test2：[9.42s] [6.07s] [6.24s]
+运行通过test2：[9.42s] [6.07s] [3.03s]
 export PYTHONPATH=$(pwd)
 pytest test/test_02_basic_transfer.py -q
 

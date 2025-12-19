@@ -36,16 +36,15 @@ BUF_SIZE: int = 1400
 CHUNK_DATA_SIZE: int = 512 * 1024
 MAX_PAYLOAD: int = 1024
 
-MAX_CONCURRENT_DOWNLOADS_PER_CHUNK = 8
-MAX_TOTAL_CONCURRENT_DOWNLOADS = 8
+MAX_TOTAL_CONCURRENT_DOWNLOADS = 20
 
 HEADER_FMT: str = "BBHII"
 HEADER_LEN: int = struct.calcsize(HEADER_FMT)
 
 MAX_WHOHAS_RETRIES: int = 3
-WINDOW_SIZE = 32
-DOWNLOAD_TIMEOUT_WITH_DATA: float = 3.0
-DOWNLOAD_TIMEOUT_WITHOUT_DATA: float = 1.0
+# Legacy constants (now using dynamic timeout, but kept for fallback)
+DOWNLOAD_TIMEOUT_WITH_DATA: float = 7.0
+DOWNLOAD_TIMEOUT_WITHOUT_DATA: float = 3.0
 
 # RTT params
 ALPHA = 0.15
@@ -75,6 +74,13 @@ class DownloadSession:
     last_ack_time: float = field(default_factory=time.time)
     waiting_chunks: List[str] = field(default_factory=list)
     timeout_count: int = 0
+    
+    # RTT estimation for download timeout
+    estimatedRTT: float = 0.5
+    devRTT: float = 0.25
+    timeoutInterval: float = 0.5
+    last_packet_time: float = field(default_factory=time.time)  # Track last packet arrival time
+    last_probe_time: float = 0.0  # Track last probe ACK send time to avoid spam
 
 
 @dataclass
@@ -156,7 +162,7 @@ class PeerState:
     def reset_download_state(self):
         """Reset download-related state for a new download."""
         self.whohas_retry_count = 0
-        self.next_whohas_retry_time = None  # 重置调度时间
+        self.next_whohas_retry_time = None  # Reset scheduled retry time
         self.want_chunks = []
         self.candidates = {}
         self.receiving = {}
@@ -177,15 +183,28 @@ class Peer:
         self.sock: Optional[simsocket.SimSocket] = None
         # self.cmd_queue: Queue[str] = Queue()
         # self.stdin_thread: Optional[threading.Thread] = None
+        
+        # Open log file
+        log_dir = os.path.join(_project_root, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"peer{self.context.identity}.log")
+        self.log_file = open(log_file, 'w', encoding='utf-8')
 
     def _log_prefix(self) -> str:
         """Generate log prefix with peer identity and address."""
         return f"[Peer{self.context.identity}@{self.context.ip}:{self.context.port}]"
 
     def _log(self, message: str):
-        """Print log message with peer prefix."""
+        """Print log message with peer prefix to both terminal and log file."""
         # if self.context.identity in [1,5]: # filter
         print(f"{self._log_prefix()} {message}")
+        log_message = f"{self._log_prefix()} {message}"
+        # Output to terminal
+        print(log_message)
+        # Output to log file
+        # if hasattr(self, 'log_file') and self.log_file:
+        #     self.log_file.write(log_message + '\n')
+        #     self.log_file.flush()  # Ensure immediate write
 
     def _record_cwnd(self, session_key: Tuple[str, Tuple[str, int]], cwnd: float, event_type: str, ssthresh: int):
         """Record cwnd change for visualization."""
@@ -204,27 +223,27 @@ class Peer:
 
         try:
             while True:
-                # 监听 socket 和 stdin（Unix 系统支持）
+                # Monitor socket and stdin (Unix systems support)
                 rlist = [self.sock]
                 try:
-                    # 尝试将 stdin 加入监听（Windows 不支持，会抛异常）
+                    # Try to add stdin to monitoring (Windows doesn't support this, will throw exception)
                     rlist.append(sys.stdin)
                 except:
                     pass
 
                 ready, _, _ = select.select(rlist, [], [], 0.01)
 
-                # 处理网络数据包
+                # Process network packets
                 if self.sock in ready:
                     self._process_inbound_udp()
 
-                # 处理 stdin 输入（非阻塞）
+                # Process stdin input (non-blocking)
                 if sys.stdin in ready:
                     line = sys.stdin.readline()
                     if line:
                         self._process_user_input(line)
 
-                # 处理超时和定时任务
+                # Handle timeouts and scheduled tasks
                 self._check_timeouts()
 
         except KeyboardInterrupt:
@@ -233,6 +252,9 @@ class Peer:
             self._plot_cwnd()
             if self.sock:
                 self.sock.close()
+            # Close log file
+            if hasattr(self, 'log_file') and self.log_file:
+                self.log_file.close()
 
     # ========================================================================
     # Step 4: Simple Modules (CommandReader, etc.)
@@ -321,14 +343,14 @@ class Peer:
                 except Exception:
                     continue
 
-            # 如果还需要继续重试，设置下次重试时间
+            # If retry is still needed, schedule next retry time
             if self.state.whohas_retry_count < MAX_WHOHAS_RETRIES:
                 self.state.next_whohas_retry_time = time.time() + 3.0
             else:
                 self.state.next_whohas_retry_time = None
 
         else:
-            # 不需要重试，清空调度时间
+            # No retry needed, clear scheduled time
             self.state.next_whohas_retry_time = None
 
 
@@ -380,18 +402,18 @@ class Peer:
 
         if have_hashes:
             if can_upload:
-                # 有chunks且可以上传：发送IHAVE
+                # Have chunks and can upload: send IHAVE
                 payload = b"".join(have_hashes)
                 pkt_ihave = _pack_header(PktType.IHAVE, HEADER_LEN + len(payload), seq=0, ack=0) + payload
                 self.sock.sendto(pkt_ihave, from_addr)
                 self._log(f"DEBUG: Sent IHAVE with {len(have_hashes)} chunks to {from_addr}")
             else:
-                # 有chunks但不能上传：发送DENIED
+                # Have chunks but cannot upload: send DENIED
                 pkt_denied = _pack_header(PktType.DENIED, HEADER_LEN, seq=0, ack=0)
                 self.sock.sendto(pkt_denied, from_addr)
                 self._log(f"DEBUG: Sent DENIED to {from_addr} (max_conn reached)")
         else:
-            # 没有请求的chunks：不回复（但不是DENIED）
+            # No requested chunks: don't reply (but not DENIED)
             self._log(f"DEBUG: No requested chunks, ignoring WHOHAS from {from_addr}")
 
     def _handle_ihave(self, from_addr: Tuple[str, int], data: bytes):
@@ -485,23 +507,23 @@ class Peer:
                 existing_session = self.state.uploads[upload_key]
                 now = time.time()
 
-                # 检查会话是否有效
+                # Check if session is valid
                 time_since_last_ack = now - existing_session.last_ack_time
                 time_since_last_send = now - existing_session.last_sent_time
 
-                # 判断会话是否真的活跃
+                # Determine if session is truly active
                 is_slow = False
                 if existing_session.total_segs is not None:
                     progress_ratio = existing_session.send_base / existing_session.total_segs
                     if progress_ratio < 0.1 and time_since_last_ack > DOWNLOAD_TIMEOUT_WITHOUT_DATA:
-                        # 刚开始但很长时间没有ACK
+                        # Just started but no ACK for a long time
                         is_slow = True
                     elif progress_ratio > 0.1 and time_since_last_ack > DOWNLOAD_TIMEOUT_WITH_DATA:
-                        # 有一定进度但长时间没有ACK
+                        # Has some progress but no ACK for a long time
                         is_slow = True
 
                 if is_slow:
-                    # 会话太慢 重置
+                    # Session too slow, reset
                     self._log(
                         f"DEBUG: GET for {requested_hex} from {addr}: upload session exists but too slow (progress={existing_session.send_base}/{existing_session.total_segs}, last_ack={time_since_last_ack:.1f}s), resetting")
                     del self.state.uploads[upload_key]
@@ -558,17 +580,24 @@ class Peer:
 
         if seq_num == expected:
             # Correct sequence number
+            now = time.time()
             self.state.receiving[chunk_hex] += payload
-            session.last_ack_time = time.time()
+            session.last_ack_time = now
+
+            # Sample RTT for download session (using packet arrival interval)
+            # This is not true RTT, but can be used for timeout estimation
+            if session.last_packet_time > 0:
+                packet_interval = now - session.last_packet_time
+                # Use packet interval as RTT estimate (multiply by 2 to approximate RTT)
+                # Since we're measuring one-way delay, we approximate RTT as 2x the interval
+                sample_rtt = max(0.001, packet_interval * 2.0)  # Ensure positive value
+                self._download_update_rtt(session, sample_rtt)
+            session.last_packet_time = now
 
             current_len = len(self.state.receiving[chunk_hex])
             expected_len = CHUNK_DATA_SIZE
             progress = min(100, (current_len * 100) / expected_len)
             self._log(f"DEBUG: Received seq={seq_num}, progress: {progress:.1f}% ({current_len}/{expected_len} bytes)")
-
-            # Send ACK
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
-            self.sock.sendto(ack_pkt, from_addr)
 
             # Update expected sequence
             session.expected_seq = expected + 1
@@ -581,16 +610,22 @@ class Peer:
 
                 self.state.receiving[chunk_hex] += next_payload
                 session.expected_seq = next_seq + 1
-                session.last_ack_time = time.time()
-
-                ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=next_seq)
-                self.sock.sendto(ack_pkt, from_addr)
+                now = time.time()
+                session.last_ack_time = now
+                session.last_packet_time = now  # Update packet time for buffered packets too
 
                 expected = next_seq
                 self._log(f"DEBUG: ✨ Delivered buffered packet seq={next_seq}, new expected={expected + 1}")
 
+            # Send ACK after processing in-order packet and all buffered packets
+            # This cumulative ACK tells sender the highest consecutive sequence number received
+            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=expected)
+            self.sock.sendto(ack_pkt, from_addr)
+            self._log(f"DEBUG: Sending ACK after buffered packets: {expected} to {from_addr}")
             # Check if complete (after processing buffered packets)
             current_expected = session.expected_seq
+
+
             if session.total_segs is not None and (current_expected - 1) == session.total_segs:
                 self._log(f"DEBUG: 📦 All segments received for {chunk_hex}")
                 self._complete_download(chunk_hex, len(self.state.receiving[chunk_hex]),
@@ -599,28 +634,29 @@ class Peer:
         elif seq_num > expected:
             # Out-of-order packet: buffer it
             buffer = self.state.out_of_order_buffer[session_key]
-            if seq_num not in buffer:
+            is_new_packet = seq_num not in buffer
+            
+            if is_new_packet:
                 buffer[seq_num] = payload
                 self._log(
                     f"DEBUG: 📦 Buffered out-of-order packet seq={seq_num}, expected={expected}, buffer_size={len(buffer)}")
+            else:
+                # Packet already in buffer (duplicate), no need to send ACK again
+                self._log(f"DEBUG: 🔁 Duplicate out-of-order packet seq={seq_num}, already buffered, expected={expected}")
 
             # Update last_ack_time even for out-of-order packets (indicates peer is still alive)
-            session.last_ack_time = time.time()
+            now = time.time()
+            session.last_ack_time = now
+            # Sample RTT for out-of-order packets too
+            if session.last_packet_time > 0:
+                packet_interval = now - session.last_packet_time
+                sample_rtt = max(0.001, packet_interval * 2.0)
+                self._download_update_rtt(session, sample_rtt)
+            session.last_packet_time = now
 
 
-            # Send cumulative ACK (但不能发送 ACK=0，因为 seq 从 1 开始)
-            if expected > 1:
-                ack_to_send = expected - 1
-                ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=ack_to_send)
-                self.sock.sendto(ack_pkt, from_addr)
-                self._log(f"DEBUG:  Sent cumulative ACK={ack_to_send} for out-of-order seq={seq_num}")
-            else:
-                # 如果 expected=1（还没收到任何数据），不发送 ACK（或者可以选择不发送）
-                # 因为没有可以确认的数据
-                self._log(f"DEBUG:  Ignoring out-of-order seq={seq_num}, expected={expected}, no data received yet")
         else:
-            ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=seq_num)
-            self.sock.sendto(ack_pkt, from_addr)
+
             self._log(f"DEBUG: 🔁 Duplicate packet seq={seq_num}, expected={expected}")
 
     def _handle_ack(self, from_addr: Tuple[str, int], ack_num: int):
@@ -650,39 +686,36 @@ class Peer:
         """Check for timeout conditions."""
         now = time.time()
 
-        # 新增：检查 WHOHAS 重试调度
+        # Check WHOHAS retry schedule
         if (self.state.next_whohas_retry_time is not None and
                 now >= self.state.next_whohas_retry_time):
-            self.state.next_whohas_retry_time = None  # 先清空，避免重复触发
+            self.state.next_whohas_retry_time = None  # Clear first to avoid duplicate triggers
             self._retry_whohas()
 
         # Check upload timeouts
         for session_key, session in list(self.state.uploads.items()):
             timeout = self._rdt_get_timeout(session)
             send_base = session.send_base
-
-            if send_base in session.sent_times:
-                last = session.sent_times[send_base]
-                if now - last > timeout:
-                    # Tahoe-style reaction on timeout
-                    cwnd = session.cwnd
-                    ssthresh = max(int(cwnd / 2), 2)
-                    session.ssthresh = ssthresh
-                    session.cwnd = 1.0
-                    session.cc_state = "slow_start"
-                    session.dupACKcount = 0
-                    self._record_cwnd(session_key, session.cwnd, 'timeout', session.ssthresh)
-                    self._log(f"DEBUG: ⏲️ Timeout: retransmit seq={send_base}")
-                    self._send_data_segment_for_session(session_key, send_base)
-
             next_seq_num = session.next_seq_num
 
-            # If we've already sent packets beyond send_base, those packets might have arrived
-            # (just ACK delayed). Don't retransmit send_base immediately in this case.
-            # Only retransmit if we haven't sent beyond send_base (indicating real loss)
-            if next_seq_num <= send_base:
-                last = session.sent_times.get(send_base, session.last_sent_time)
-                if now - last > timeout:
+            # Check timeout for send_base
+            # Only check if send_base has been sent (exists in sent_times)
+            if send_base in session.sent_times:
+                last = session.sent_times[send_base]
+                elapsed = now - last
+                
+                # For concurrent sessions, we need to be more conservative:
+                # - If we've sent packets beyond send_base, ACK might just be delayed
+                # - Use a more conservative timeout (1.5x) in this case
+                if next_seq_num > send_base:
+                    # We've sent packets beyond send_base, ACK might be delayed
+                    # Use more conservative timeout to avoid false positives
+                    effective_timeout = timeout * 1.5
+                else:
+                    # We haven't sent beyond send_base, use normal timeout
+                    effective_timeout = timeout
+                
+                if elapsed > effective_timeout:
                     # Tahoe-style reaction on timeout
                     cwnd = session.cwnd
                     ssthresh = max(int(cwnd / 2), 2)
@@ -692,32 +725,37 @@ class Peer:
                     session.dupACKcount = 0
                     self._record_cwnd(session_key, session.cwnd, 'timeout', session.ssthresh)
                     self._log(
-                        f"DEBUG: ⏲️ Timeout: set ssthresh={ssthresh}, cwnd=1, cc_state=slow_start; retransmit seq={send_base}")
-                    seq_to_retransmit = send_base
-                    self._send_data_segment_for_session(session_key, seq_to_retransmit)
+                        f"DEBUG: ⏲️ Timeout: retransmit seq={send_base} (elapsed={elapsed:.3f}s > timeout={effective_timeout:.3f}s, "
+                        f"next_seq={next_seq_num}, cwnd={cwnd:.2f})")
+                    self._send_data_segment_for_session(session_key, send_base)
 
         # Check download timeouts
-        # Always check download timeouts regardless of context.timeout setting
-        # (context.timeout is for upload RTT estimation, not download timeout detection)
+        # Use dynamic timeout based on RTT estimation for download sessions
         for session_key, session in list(self.state.downloading.items()):
             last_recv = session.last_ack_time
             expected_seq = session.expected_seq
             total_segs = session.total_segs
 
-            # 没有收到任何数据 使用较短超时
-            if expected_seq == 1:
-                if now - last_recv > DOWNLOAD_TIMEOUT_WITHOUT_DATA:
-                    self._handle_download_timeout(session_key)
+            # Get dynamic timeout for download session
+            timeout = self._download_get_timeout(session)
+            
+            # Check if session has timed out
+            if now - last_recv > timeout:
+                self._log(f"DEBUG: Download timeout: expected_seq={expected_seq}, total_segs={total_segs}, timeout={timeout:.2f}s, elapsed={now - last_recv:.2f}s")
+                self._handle_download_timeout(session_key)
+            # else:
+                # if now - last_recv > DOWNLOAD_TIMEOUT_WITH_DATA:
+                #     # Only log progress, don't terminate session (let first level handle true timeout)
+                #     self._log(f"DEBUG: Download progress slow: expected_seq={expected_seq}, total_segs={total_segs}")
+                #     # Optional: send probe ACK to remind sender
             else:
-                if now - last_recv > DOWNLOAD_TIMEOUT_WITH_DATA:
-                    self._log(f"DEBUG: Download progress: expected_seq={expected_seq}, total_segs={total_segs}")
-                    self._handle_download_timeout(session_key)
-                else:
-                    if now - last_recv > 5.0 and total_segs is not None:
-                        ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=expected_seq - 1)
-                        addr = session_key[0]  # (ip, port)
-                        self.sock.sendto(ack_pkt, addr)
-                        self._log(f"DEBUG: 🔍 Sending probe ACK {expected_seq - 1} to {addr}")
+                # Send probe ACK if elapsed > threshold, but limit frequency to avoid spam
+                probe_threshold = min(timeout * 0.7, 5.0)  # 70% of timeout or 5s, whichever is smaller
+                if now - last_recv > probe_threshold and total_segs is not None:
+                    ack_pkt = _pack_header(PktType.ACK, HEADER_LEN, seq=0, ack=expected_seq - 1)
+                    addr = session_key[0]  # (ip, port)
+                    self.sock.sendto(ack_pkt, addr)
+                    self._log(f"DEBUG: 🔍 Sending probe ACK {expected_seq - 1} to {addr} (elapsed={now - last_recv:.2f}s, timeout={timeout:.2f}s)")
 
     # ========================================================================
     # Upload Session Management
@@ -817,7 +855,6 @@ class Peer:
         effective_cwnd = int(cwnd)
         # max_inflight = min(effective_cwnd, WINDOW_SIZE)
         max_inflight = effective_cwnd
-
         while (next_seq_num - send_base) < max_inflight and next_seq_num <= total_segs:
             self._send_data_segment_for_session(session_key, next_seq_num)
             session.next_seq_num = next_seq_num + 1
@@ -948,8 +985,12 @@ class Peer:
             # Retransmit
             self._send_data_segment_for_session(session_key, seq=next_seq)
             session.send_base = ack_num + 1
-            session.next_seq_num = max(session.next_seq_num, ack_num + 2)
-            self._log(f"DEBUG:  Tahoe reaction: ssthresh={ssthresh}, cwnd=1")
+            # session.next_seq_num = max(session.next_seq_num, ack_num + 2)
+            # self._log(f"DEBUG:  Tahoe reaction: ssthresh={ssthresh}, cwnd=1")
+            session.next_seq_num = ack_num + 1
+            self._log(f"DEBUG:  Tahoe reaction: ssthresh={ssthresh}, cwnd=1, next_seq_num={session.next_seq_num}")
+
+
 
     # ========================================================================
     # Cwnd Visualization
@@ -1184,13 +1225,57 @@ class Peer:
 
         session.estimatedRTT = est
         session.devRTT = dev
-        session.timeoutInterval = max(0.5, est + 4 * dev)
+        # Use more conservative timeout: ensure minimum timeout and add safety margin
+        # For concurrent sessions, we need larger timeout to account for network competition
+        base_timeout = est + 4 * dev
+        # Ensure minimum timeout of 1.0s (instead of 0.5s) for better stability
+        # Add 20% safety margin for concurrent sessions
+        session.timeoutInterval = max(1.0, base_timeout * 1.2)
 
     def _rdt_get_timeout(self, session: UploadSession) -> float:
         """Return the effective timeout for the session."""
         if getattr(self.context, "timeout", 0):
             return float(session.timeout)
-        return max(0.5, float(session.timeoutInterval if session.timeoutInterval else session.timeout or 0.5))
+        # Use timeoutInterval if available, ensure minimum of 1.0s for stability
+        timeout = float(session.timeoutInterval if session.timeoutInterval else session.timeout or 0.5)
+        # Ensure minimum timeout of 1.0s to avoid premature timeouts in concurrent scenarios
+        return max(1.0, timeout)
+
+    def _download_update_rtt(self, session: DownloadSession, sampleRTT: float):
+        """Update EstimatedRTT / DevRTT / TimeoutInterval for download session."""
+        prevEst = session.estimatedRTT
+        prevDev = session.devRTT
+
+        if prevEst is None or prevEst == 0:
+            # First sample: set estimates directly
+            est = sampleRTT
+            dev = sampleRTT / 2.0
+        else:
+            est = (1 - ALPHA) * prevEst + ALPHA * sampleRTT
+            prevDev = prevDev if prevDev is not None else sampleRTT / 2.0
+            dev = (1 - BETA) * prevDev + BETA * abs(sampleRTT - est)
+
+        session.estimatedRTT = est
+        session.devRTT = dev
+        session.timeoutInterval = max(0.5, est + 4 * dev)
+
+    def _download_get_timeout(self, session: DownloadSession) -> float:
+        """Return the effective timeout for the download session."""
+        # Use dynamic timeoutInterval if available, otherwise fall back to fixed values
+        if session.timeoutInterval > 0 and session.estimatedRTT > 0:
+            # For download session timeout, we use a multiplier of timeoutInterval
+            # Since timeoutInterval = EstimatedRTT + 4*DevRTT, we multiply by 3-5x
+            # to detect session-level timeout (peer crash) rather than packet-level timeout
+            # This ensures we wait long enough for slow networks but detect failures quickly
+            multiplier = 3.0 if session.expected_seq == 1 else 5.0  # Longer timeout if we've received data
+            dynamic_timeout = max(1.0, min(30.0, session.timeoutInterval * multiplier))
+            return dynamic_timeout
+        else:
+            # Fallback to fixed timeout based on whether we've received data
+            if session.expected_seq == 1:
+                return DOWNLOAD_TIMEOUT_WITHOUT_DATA
+            else:
+                return DOWNLOAD_TIMEOUT_WITH_DATA
 
     # ========================================================================
     # Download Management
@@ -1198,11 +1283,11 @@ class Peer:
 
     def _handle_download_timeout(self, session_key: Tuple[Tuple[str, int], str]):
         """
-        下载端检测到某个发送端长时间无响应（可能崩溃）时：
-        1. 清空当前 chunk 的已接收数据；
-        2. 将该发送端从候选列表中移除；
-        3. 若还有其它候选 peer，则向其重新发送 GET；
-        4. 若没有候选，则重新对该 chunk 发送 WHOHAS。
+        When downloader detects that a sender has been unresponsive for a long time (possibly crashed):
+        1. Clear received data for current chunk;
+        2. Remove the sender from candidate list;
+        3. If other candidate peers exist, resend GET to one of them;
+        4. If no candidates, resend WHOHAS for the chunk.
         """
         session = self.state.downloading.pop(session_key, None)
         if not session:
@@ -1211,7 +1296,7 @@ class Peer:
         addr, chunk_hex = session_key
         session.timeout_count += 1
 
-        # 如果超时次数太多 放弃这个peer
+        # If timeout count is too high, abandon this peer
         if session.timeout_count >= 3:
             self._log(f"DEBUG: Abandoning {addr} for chunk {chunk_hex} after {session.timeout_count} timeouts")
             if chunk_hex in self.state.receiving:
@@ -1226,22 +1311,21 @@ class Peer:
 
         self._log(f"DEBUG: Download timeout #{session.timeout_count} for chunk {chunk_hex} from {addr}")
 
-        # 1. 清空该 chunk 已接收的数据
+        # 1. Clear received data for this chunk
         if chunk_hex in self.state.receiving:
             self.state.receiving[chunk_hex] = b""
 
-        # 清理乱序缓冲区
+        # Clear out-of-order buffer
         if session_key in self.state.out_of_order_buffer:
             del self.state.out_of_order_buffer[session_key]
 
-        # 2. 从候选列表中移除当前发送端
+        # 2. Remove current sender from candidate list
         cand_list = self.state.candidates.get(chunk_hex, [])
         cand_list = [c for c in cand_list if c != addr]
         self.state.candidates[chunk_hex] = cand_list
 
-        # TODO: waiting_chunks 处理 再次发送WHOHAS找谁有该chunk
 
-        # 3. 若还有其它候选 peer，直接向其中一个发送 GET 并创建新的下载会话
+        # 3. If other candidate peers exist, directly send GET to one and create new download session
         if cand_list:
             # Check if already downloading this chunk from another peer
             if any(sess.chunk == chunk_hex for sess in self.state.downloading.values()):
@@ -1252,7 +1336,7 @@ class Peer:
             try:
                 payload = _hex_to_bytes(chunk_hex)
             except ValueError:
-                # 非法 hash，放弃
+                # Invalid hash, abandon
                 return
 
             pkt_get = _pack_header(PktType.GET, HEADER_LEN + len(payload), seq=0, ack=0) + payload
@@ -1267,14 +1351,19 @@ class Peer:
                 waiting_chunks=[]
             )
 
-            # 确保接收缓冲区已初始化
+            # Ensure receive buffer is initialized
             if chunk_hex not in self.state.receiving:
                 self.state.receiving[chunk_hex] = b""
+
+            # Clear out-of-order buffer for retry session (prevent data from previous attempts)
+            retry_session_key = (new_addr, chunk_hex)
+            if retry_session_key in self.state.out_of_order_buffer:
+                del self.state.out_of_order_buffer[retry_session_key]
 
             self._log(f"DEBUG: Retry chunk {chunk_hex} from backup peer {new_addr}")
             return
 
-        # 4. 没有其它候选 peer，重新对所有 want_chunks 发送 WHOHAS，等待新的 IHAVE
+        # 4. No other candidate peers, resend WHOHAS for all want_chunks, wait for new IHAVE
         if self.state.want_chunks:
             try:
                 # Send WHOHAS for all remaining want_chunks
@@ -1314,12 +1403,12 @@ class Peer:
             self._log(f"DEBUG: No session found for {chunk_hex}")
             return
 
-        # 检查是否真的完成了
+        # Check if truly completed
         if session.total_segs is None:
             self._log(f"DEBUG: total_segs is None, cannot complete for {chunk_hex}")
             return
 
-        # 检查是否收到了所有segment
+        # Check if all segments received
         if seq_num != session.total_segs:
             self._log(
                 f"DEBUG: Not the last segment for {chunk_hex}: received seq {seq_num}, expected last {session.total_segs}")
@@ -1406,6 +1495,10 @@ class Peer:
                             # Initialize receiving buffer
                             if next_chunk_hex not in self.state.receiving:
                                 self.state.receiving[next_chunk_hex] = b""
+
+                            # Clear out-of-order buffer for new session (prevent data from previous chunks)
+                            if new_session_key in self.state.out_of_order_buffer:
+                                del self.state.out_of_order_buffer[new_session_key]
 
                             self._log(f"DEBUG: Created new download session for {next_chunk_hex} from {from_addr}")
                         except ValueError:
