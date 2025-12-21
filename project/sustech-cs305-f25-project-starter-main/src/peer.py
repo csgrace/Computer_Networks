@@ -89,24 +89,20 @@ class UploadSession:
     addr: Tuple[str, int]
     chunk_bytes: bytes
     total_segs: int
-
     # RDT / timing
     last_sent_seq: int = 0
     last_sent_time: float = 0.0
     timeout: float = 0.5
     sent_times: Dict[int, float] = field(default_factory=dict)
-
     # ACK / seq window
     last_acked: int = 0
     send_base: int = 1
     next_seq_num: int = 1
     last_ack_time: float = field(default_factory=time.time)  # Track when we last received an ACK
-
     # RTT estimation
     estimatedRTT: float = 0.5
     devRTT: float = 0.25
     timeoutInterval: float = 0.5
-
     # Congestion control (Tahoe-style)
     cc_state: str = "slow_start"  # "slow_start" or "congestion_avoidance"
     ssthresh: int = 64
