@@ -128,22 +128,22 @@ python -m src.peer --config example/topology.json
 
 ```
 Computer_Networks/
-  lecture/                       # Weekly slides (Kurose & Ross 8th Ed.)
-    assignment/                  # Slide-based assignments
-    笔记/                        # Lecture notes
-  lab/                           # 14 weekly lab assignments
-    lab1-lab14/                  # Lab source and instructions
-    assignment/                  # Lab reports and submissions
-  project/                       # Capstone project (Fall 2025)
-    sustech-cs305-f25-project-starter-main/
-      src/                       # Source code
-      test/                      # Test suite
-      example/                   # Example configs and topologies
-      docs/                      # Project documentation
-  CS305B-2021Spring-Midterm.pdf  # Past midterm reference
-  计网期末.pdf                   # Final review materials
-  computer-networking-a-top-down-approach-8th-edition.pdf  # Textbook
-  README.md
+|-- lecture/                       # Weekly slides (Kurose & Ross 8th Ed.)
+|   |-- assignment/                # Slide-based assignments
+|   |-- 笔记/                       # Lecture notes
+|-- lab/                           # 14 weekly lab assignments
+|   |-- lab1-lab14/                # Lab source and instructions
+|   |-- assignment/                # Lab reports and submissions
+|-- project/                       # Capstone project (Fall 2025)
+|   |-- sustech-cs305-f25-project-starter-main/
+|       |-- src/                   # Source code
+|       |-- test/                  # Test suite
+|       |-- example/               # Example configs and topologies
+|       |-- docs/                  # Project documentation
+|-- CS305B-2021Spring-Midterm.pdf  # Past midterm reference
+|-- 计网期末.pdf                    # Final review materials
+|-- computer-networking-a-top-down-approach-8th-edition.pdf  # Textbook
+└── README.md
 ```
 
 ---
